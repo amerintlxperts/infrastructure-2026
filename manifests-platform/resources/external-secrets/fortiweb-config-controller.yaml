@@ -1,0 +1,58 @@
+# =============================================================================
+# FortiWeb Config - External Secret (fortiweb-controller namespace)
+# =============================================================================
+# Syncs FortiWeb network configuration from AWS Secrets Manager to the
+# fortiweb-controller namespace. Used by both the controller and bootstrap job.
+#
+# Values from dev/fortiweb-network:
+#   - FORTIWEB_IP: Private IP for API connection (port2)
+#   - FORTIWEB_PORT: API port (8443)
+#   - FORTIWEB_PUBLIC_IP: Public EIP for DNS target
+#   - FORTIWEB_PORT1_IP: Private IP of port1 for virtual server
+#   - instance_id: EC2 instance ID (used by bootstrap job for default password)
+# =============================================================================
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fortiweb-config
+  namespace: fortiweb-controller
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: fortiweb-config
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        # FortiWeb API connection
+        FORTIWEB_IP: "{{ .FORTIWEB_IP }}"
+        FORTIWEB_PORT: "{{ .FORTIWEB_PORT }}"
+        # FortiWeb network IPs
+        FORTIWEB_PUBLIC_IP: "{{ .FORTIWEB_PUBLIC_IP }}"
+        FORTIWEB_PORT1_IP: "{{ .FORTIWEB_PORT1_IP }}"
+        # Instance ID for bootstrap job
+        instance_id: "{{ .instance_id }}"
+  data:
+    - secretKey: FORTIWEB_IP
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_IP
+    - secretKey: FORTIWEB_PORT
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_PORT
+    - secretKey: FORTIWEB_PUBLIC_IP
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_PUBLIC_IP
+    - secretKey: FORTIWEB_PORT1_IP
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_PORT1_IP
+    - secretKey: instance_id
+      remoteRef:
+        key: dev/fortiweb-network
+        property: instance_id

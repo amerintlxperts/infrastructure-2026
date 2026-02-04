@@ -1,0 +1,172 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 5 - IAM & IRSA
+================================================================================
+
+## Task
+
+Create IAM roles that can be assumed by Kubernetes service accounts using IRSA.
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Authentication: IRSA (IAM Roles for Service Accounts)
+- Specification: See `spec/module5_iam_irsa.txt` for full details
+
+## Prerequisites
+
+- [ ] Module 2 (EKS) completed
+- [ ] OIDC provider ARN and URL available
+
+## Deliverables
+
+```
+terraform/modules/irsa/
+├── main.tf        # Generic IRSA role module
+├── variables.tf
+├── outputs.tf
+└── README.md
+
+terraform/environments/dev/
+├── irsa.tf        # Platform role definitions
+└── irsa_outputs.tf
+```
+
+## Implementation Requirements
+
+### 1. Reusable IRSA Module
+
+```hcl
+# modules/irsa/main.tf
+locals {
+  oidc_issuer = replace(var.oidc_provider_url, "https://", "")
+}
+
+resource "aws_iam_role" "main" {
+  name = "${var.project_name}-${var.environment}-${var.role_name}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:${var.namespace}:${var.service_account}"
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "main" {
+  name   = "policy"
+  role   = aws_iam_role.main.id
+  policy = var.policy_json
+}
+```
+
+### 2. Platform Roles to Create
+
+**External Secrets Operator**:
+- Namespace: external-secrets
+- ServiceAccount: external-secrets
+- Permissions: secretsmanager:GetSecretValue, secretsmanager:DescribeSecret
+- Resource: `arn:aws:secretsmanager:ca-central-1:*:secret:dev/*`
+
+**CloudWatch Agent**:
+- Namespace: amazon-cloudwatch
+- ServiceAccount: cloudwatch-agent
+- Permissions: CloudWatchAgentServerPolicy (managed)
+
+**Fluent Bit**:
+- Namespace: amazon-cloudwatch
+- ServiceAccount: fluent-bit
+- Permissions: logs:CreateLogGroup, CreateLogStream, PutLogEvents
+- Resource: `/aws/eks/xperts-dev/*`
+
+### 3. Example Role Definition
+
+```hcl
+# environments/dev/irsa.tf
+module "external_secrets_irsa" {
+  source = "../../modules/irsa"
+
+  project_name      = var.project_name
+  environment       = var.environment
+  oidc_provider_arn = module.eks.oidc_provider_arn
+  oidc_provider_url = module.eks.oidc_provider_url
+  role_name         = "external-secrets"
+  namespace         = "external-secrets"
+  service_account   = "external-secrets"
+
+  policy_json = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ]
+      Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${var.environment}/*"
+    }]
+  })
+}
+```
+
+## Testing
+
+```bash
+# Check role trust policy
+aws iam get-role --role-name xperts-dev-external-secrets \
+  --query 'Role.AssumeRolePolicyDocument'
+
+# Test from pod (after deploying ESO)
+kubectl run irsa-test --rm -it \
+  --image=amazon/aws-cli \
+  --overrides='{
+    "spec": {
+      "serviceAccountName": "external-secrets"
+    }
+  }' \
+  -n external-secrets \
+  -- sts get-caller-identity
+
+# Expected: Shows assumed role ARN
+```
+
+## Expected Outputs
+
+```hcl
+output "external_secrets_role_arn" {}
+output "cloudwatch_agent_role_arn" {}
+output "fluent_bit_role_arn" {}
+```
+
+## Important Notes
+
+- OIDC issuer URL must NOT have `https://` prefix in conditions
+- Service account must exist before pod can assume role
+- Role ARN goes in ServiceAccount annotation
+
+## Kubernetes ServiceAccount Example
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-secrets
+  namespace: external-secrets
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/xperts-dev-external-secrets
+```
+
+## Reference
+
+- Full specification: `spec/module5_iam_irsa.txt`
+- ADR: `architecture/adr/002-irsa-for-aws-authentication.md`
+
+================================================================================

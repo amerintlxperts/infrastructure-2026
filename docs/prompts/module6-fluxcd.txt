@@ -1,0 +1,207 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 6 - FLUXCD BOOTSTRAP
+================================================================================
+
+## Task
+
+Bootstrap FluxCD onto the EKS cluster with GitHub App authentication.
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- GitHub Org: amerintlxperts
+- Repository: gitops-platform
+- Authentication: GitHub App
+- Specification: See `spec/module6_fluxcd_bootstrap.txt` for full details
+
+## Prerequisites
+
+- [ ] EKS cluster running with nodes ready
+- [ ] kubectl configured for cluster
+- [ ] Flux CLI installed
+- [ ] GitHub App created in amerintlxperts org with:
+  - Repository contents: Read
+  - Repository metadata: Read
+- [ ] GitHub App installed on gitops-platform repo
+- [ ] App credentials in Secrets Manager:
+  - `dev/github-app/config` (app_id, installation_id)
+  - `dev/github-app/private-key`
+
+## Steps
+
+### 1. Create GitHub App (if not done)
+
+1. Go to: GitHub > amerintlxperts > Settings > Developer settings > GitHub Apps
+2. Create new GitHub App:
+   - Name: `amerintlxperts-fluxcd`
+   - Homepage: `https://github.com/amerintlxperts`
+   - Webhook: Deactivate
+   - Permissions:
+     - Repository contents: Read-only
+     - Repository metadata: Read-only
+   - Where installed: Only this account
+3. Generate and download private key
+4. Note App ID
+5. Install App on `gitops-platform` repo
+6. Note Installation ID from URL
+
+### 2. Store Credentials in AWS
+
+```bash
+# Store config
+aws secretsmanager create-secret \
+  --name "dev/github-app/config" \
+  --secret-string '{"app_id": "123456", "installation_id": "12345678"}'
+
+# Store private key
+aws secretsmanager create-secret \
+  --name "dev/github-app/private-key" \
+  --secret-string "$(cat private-key.pem)"
+```
+
+### 3. Retrieve Credentials
+
+```bash
+APP_CONFIG=$(aws secretsmanager get-secret-value \
+  --secret-id dev/github-app/config \
+  --query SecretString --output text)
+
+export GITHUB_APP_ID=$(echo $APP_CONFIG | jq -r '.app_id')
+export GITHUB_APP_INSTALLATION_ID=$(echo $APP_CONFIG | jq -r '.installation_id')
+
+aws secretsmanager get-secret-value \
+  --secret-id dev/github-app/private-key \
+  --query SecretString --output text > /tmp/github-app-key.pem
+```
+
+### 4. Run Bootstrap
+
+```bash
+flux bootstrap github \
+  --owner=amerintlxperts \
+  --repository=gitops-platform \
+  --branch=main \
+  --path=clusters/dev \
+  --personal=false \
+  --github-app-id=${GITHUB_APP_ID} \
+  --github-app-installation-id=${GITHUB_APP_INSTALLATION_ID} \
+  --github-app-private-key-path=/tmp/github-app-key.pem
+
+# Clean up
+rm /tmp/github-app-key.pem
+```
+
+### 5. Verify Installation
+
+```bash
+# Check components
+flux check
+
+# Check sources
+flux get sources git
+
+# Check kustomizations
+flux get kustomizations
+
+# Check pods
+kubectl get pods -n flux-system
+```
+
+### 6. Create Repository Structure
+
+After bootstrap, add infrastructure base:
+
+```bash
+cd gitops-platform
+
+# Create directories
+mkdir -p clusters/dev/infrastructure
+
+# Create Helm repositories source
+cat > clusters/dev/infrastructure/sources.yaml << 'EOF'
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: external-secrets
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://charts.external-secrets.io
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: eks-charts
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://aws.github.io/eks-charts
+EOF
+
+# Create kustomization
+cat > clusters/dev/infrastructure/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - sources.yaml
+EOF
+
+# Create infrastructure Kustomization
+cat > clusters/dev/infrastructure.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  interval: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/infrastructure
+  prune: true
+  wait: true
+EOF
+
+git add .
+git commit -m "Add infrastructure base"
+git push
+```
+
+## Expected Result
+
+Repository structure after bootstrap:
+```
+gitops-platform/
+├── clusters/
+│   └── dev/
+│       ├── flux-system/           # Auto-generated
+│       │   ├── gotk-components.yaml
+│       │   ├── gotk-sync.yaml
+│       │   └── kustomization.yaml
+│       ├── infrastructure/        # Manually added
+│       │   ├── kustomization.yaml
+│       │   └── sources.yaml
+│       └── infrastructure.yaml    # Manually added
+└── README.md
+```
+
+## Testing
+
+```bash
+# Force reconciliation
+flux reconcile source git flux-system
+
+# Watch sync status
+flux get kustomizations -w
+
+# Check HelmRepositories
+flux get sources helm
+```
+
+## Reference
+
+- Full specification: `spec/module6_fluxcd_bootstrap.txt`
+- ADR: `architecture/adr/003-fluxcd-with-github-app.md`
+
+================================================================================

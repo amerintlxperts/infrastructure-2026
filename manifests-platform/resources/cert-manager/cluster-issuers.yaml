@@ -1,0 +1,49 @@
+# =============================================================================
+# ClusterIssuers - Let's Encrypt with DNS-01 Challenge
+# =============================================================================
+# Cluster-wide certificate issuers using DNS-01 validation via Route53.
+# DNS-01 is required because HTTP-01 solver ingresses conflict with the
+# centralized gateway ingress (both bind to same IP:port).
+#
+# USAGE:
+# Reference in Certificate resources:
+#   issuerRef:
+#     name: letsencrypt-prod
+#     kind: ClusterIssuer
+#
+# REQUIREMENTS:
+# - cert-manager service account must have IRSA role with Route53 permissions
+# - Route53 hosted zone must exist for the domain
+# =============================================================================
+---
+# Staging issuer - use for testing (higher rate limits, untrusted certs)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    email: ajammes@fortinet.com
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: ca-central-1
+---
+# Production issuer - use for real certificates
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    email: ajammes@fortinet.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: ca-central-1

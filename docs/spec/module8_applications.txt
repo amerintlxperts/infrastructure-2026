@@ -1,0 +1,845 @@
+================================================================================
+MODULE 8: APPLICATIONS SPECIFICATION
+================================================================================
+
+## Overview
+
+This module demonstrates deploying applications to the platform using GitOps
+patterns. Applications leverage the platform components (External Secrets,
+observability) and follow best practices for Kubernetes deployments.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Application Deployment Flow                          │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                   gitops-platform repository                           │  │
+│  │                                                                        │  │
+│  │  apps/                                                                 │  │
+│  │  └── sample-app/                                                      │  │
+│  │      ├── base/                    ← Shared manifests                  │  │
+│  │      │   ├── kustomization.yaml                                       │  │
+│  │      │   ├── deployment.yaml                                          │  │
+│  │      │   ├── service.yaml                                             │  │
+│  │      │   ├── serviceaccount.yaml                                      │  │
+│  │      │   └── externalsecret.yaml                                      │  │
+│  │      └── overlays/                                                    │  │
+│  │          └── dev/                 ← Environment-specific              │  │
+│  │              ├── kustomization.yaml                                   │  │
+│  │              └── deployment-patch.yaml                                │  │
+│  │                                                                        │  │
+│  │  clusters/dev/apps/                                                   │  │
+│  │  └── sample-app.yaml             ← Kustomization reference            │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                         │                                   │
+│                                         │ FluxCD reconciles                 │
+│                                         ▼                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                         EKS Cluster                                    │  │
+│  │                                                                        │  │
+│  │  namespace: sample-app                                                │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │                                                                  │  │  │
+│  │  │  ┌─────────────────┐    ┌─────────────────┐                    │  │  │
+│  │  │  │  ServiceAccount │    │ ExternalSecret  │                    │  │  │
+│  │  │  │  (IRSA enabled) │    │ (syncs secrets) │                    │  │  │
+│  │  │  └─────────────────┘    └─────────────────┘                    │  │  │
+│  │  │           │                      │                              │  │  │
+│  │  │           │                      │ Creates                      │  │  │
+│  │  │           │                      ▼                              │  │  │
+│  │  │           │             ┌─────────────────┐                    │  │  │
+│  │  │           │             │  K8s Secret     │                    │  │  │
+│  │  │           │             │  (app-secrets)  │                    │  │  │
+│  │  │           │             └─────────────────┘                    │  │  │
+│  │  │           │                      │                              │  │  │
+│  │  │           ▼                      │ Mounts                       │  │  │
+│  │  │  ┌────────────────────────────────┴──────────────────────────┐ │  │  │
+│  │  │  │                    Deployment                              │ │  │  │
+│  │  │  │                                                            │ │  │  │
+│  │  │  │  ┌──────────────┐  ┌──────────────┐                       │ │  │  │
+│  │  │  │  │    Pod 1     │  │    Pod 2     │                       │ │  │  │
+│  │  │  │  │              │  │              │                       │ │  │  │
+│  │  │  │  │ Image: ECR   │  │ Image: ECR   │                       │ │  │  │
+│  │  │  │  │ pull-through │  │ pull-through │                       │ │  │  │
+│  │  │  │  │              │  │              │                       │ │  │  │
+│  │  │  │  │ Env: secrets │  │ Env: secrets │                       │ │  │  │
+│  │  │  │  │ from K8s     │  │ from K8s     │                       │ │  │  │
+│  │  │  │  └──────────────┘  └──────────────┘                       │ │  │  │
+│  │  │  └───────────────────────────────────────────────────────────┘ │  │  │
+│  │  │                              │                                  │  │  │
+│  │  │                              │                                  │  │  │
+│  │  │  ┌───────────────────────────▼──────────────────────────────┐  │  │  │
+│  │  │  │                       Service                             │  │  │  │
+│  │  │  │                  (ClusterIP:80)                           │  │  │  │
+│  │  │  └───────────────────────────────────────────────────────────┘  │  │  │
+│  │  │                                                                  │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **Kustomize Patterns**
+   - Base and overlay structure
+   - Strategic merge patches
+   - ConfigMap/Secret generators
+
+2. **Application Secrets**
+   - ExternalSecret configuration
+   - Secret injection patterns
+   - Environment variables vs volumes
+
+3. **Deployment Best Practices**
+   - Health checks (liveness/readiness)
+   - Resource limits
+   - Pod disruption budgets
+   - Horizontal pod autoscaling
+
+4. **GitOps Application Management**
+   - Kustomization dependencies
+   - Image update automation
+   - Rollback procedures
+
+## Component Deep Dive
+
+### 1. Application Base Structure
+
+**Purpose**: Reusable application manifests
+
+Directory: `apps/sample-app/base/`
+
+**kustomization.yaml**:
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - externalsecret.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+
+commonLabels:
+  app.kubernetes.io/name: sample-app
+  app.kubernetes.io/part-of: platform
+```
+
+**namespace.yaml**:
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-app
+  labels:
+    app.kubernetes.io/managed-by: flux
+```
+
+**serviceaccount.yaml**:
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sample-app
+  annotations:
+    # IRSA annotation - value from overlay
+    eks.amazonaws.com/role-arn: ""
+```
+
+**externalsecret.yaml**:
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: sample-app-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: sample-app-secrets
+    creationPolicy: Owner
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: dev/sample-app/database
+        property: url
+    - secretKey: API_KEY
+      remoteRef:
+        key: dev/sample-app/api
+        property: key
+```
+
+**deployment.yaml**:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sample-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sample-app
+    spec:
+      serviceAccountName: sample-app
+
+      containers:
+        - name: app
+          # Image will be transformed by Kustomize
+          image: ghcr.io/amerintlxperts/sample-app:latest
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          envFrom:
+            - secretRef:
+                name: sample-app-secrets
+
+          env:
+            - name: ENVIRONMENT
+              value: "dev"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+
+      securityContext:
+        fsGroup: 1000
+```
+
+**service.yaml**:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app
+spec:
+  selector:
+    app.kubernetes.io/name: sample-app
+  ports:
+    - port: 80
+      targetPort: http
+      name: http
+  type: ClusterIP
+```
+
+**hpa.yaml**:
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sample-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sample-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+### 2. Environment Overlay
+
+**Purpose**: Environment-specific customizations
+
+Directory: `apps/sample-app/overlays/dev/`
+
+**kustomization.yaml**:
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sample-app
+
+resources:
+  - ../../base
+
+# Transform image to ECR pull-through cache
+images:
+  - name: ghcr.io/amerintlxperts/sample-app
+    newName: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/sample-app
+    newTag: v1.0.0
+
+# Apply patches
+patches:
+  - path: deployment-patch.yaml
+  - path: serviceaccount-patch.yaml
+
+# Dev-specific replicas
+replicas:
+  - name: sample-app
+    count: 2
+```
+
+**deployment-patch.yaml**:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: ENVIRONMENT
+              value: "dev"
+            - name: LOG_LEVEL
+              value: "debug"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+```
+
+**serviceaccount-patch.yaml**:
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sample-app
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/xperts-dev-sample-app
+```
+
+### 3. Cluster Reference
+
+**Purpose**: Tell FluxCD to deploy this application
+
+File: `clusters/dev/apps/sample-app.yaml`
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: sample-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./apps/sample-app/overlays/dev
+  prune: true
+  wait: true
+  timeout: 5m
+  dependsOn:
+    - name: infrastructure  # Wait for ESO
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: sample-app
+      namespace: sample-app
+```
+
+### 4. Apps Kustomization
+
+**Purpose**: Reference all application Kustomizations
+
+File: `clusters/dev/apps/kustomization.yaml`
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - sample-app.yaml
+  # - another-app.yaml
+```
+
+File: `clusters/dev/apps.yaml`
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/apps
+  prune: true
+  dependsOn:
+    - name: infrastructure
+```
+
+## Step-by-Step Implementation
+
+### Step 1: Create Application Structure
+
+```bash
+cd gitops-platform
+
+# Create directory structure
+mkdir -p apps/sample-app/{base,overlays/dev}
+mkdir -p clusters/dev/apps
+```
+
+### Step 2: Create Base Manifests
+
+```bash
+# Namespace
+cat > apps/sample-app/base/namespace.yaml << 'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-app
+EOF
+
+# ServiceAccount
+cat > apps/sample-app/base/serviceaccount.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sample-app
+  annotations:
+    eks.amazonaws.com/role-arn: ""
+EOF
+
+# ExternalSecret
+cat > apps/sample-app/base/externalsecret.yaml << 'EOF'
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: sample-app-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: sample-app-secrets
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: dev/sample-app/database
+        property: url
+EOF
+
+# Deployment
+cat > apps/sample-app/base/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sample-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sample-app
+    spec:
+      serviceAccountName: sample-app
+      containers:
+        - name: app
+          image: ghcr.io/amerintlxperts/sample-app:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: sample-app-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+EOF
+
+# Service
+cat > apps/sample-app/base/service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app
+spec:
+  selector:
+    app.kubernetes.io/name: sample-app
+  ports:
+    - port: 80
+      targetPort: http
+EOF
+
+# Base kustomization
+cat > apps/sample-app/base/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - externalsecret.yaml
+  - deployment.yaml
+  - service.yaml
+commonLabels:
+  app.kubernetes.io/name: sample-app
+EOF
+```
+
+### Step 3: Create Dev Overlay
+
+```bash
+# Overlay kustomization
+cat > apps/sample-app/overlays/dev/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sample-app
+resources:
+  - ../../base
+images:
+  - name: ghcr.io/amerintlxperts/sample-app
+    newName: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/sample-app
+    newTag: v1.0.0
+patches:
+  - path: serviceaccount-patch.yaml
+EOF
+
+# ServiceAccount patch with IRSA
+cat > apps/sample-app/overlays/dev/serviceaccount-patch.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sample-app
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/xperts-dev-sample-app
+EOF
+```
+
+### Step 4: Create Cluster References
+
+```bash
+# App Kustomization reference
+cat > clusters/dev/apps/sample-app.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: sample-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./apps/sample-app/overlays/dev
+  prune: true
+  wait: true
+  dependsOn:
+    - name: infrastructure
+EOF
+
+# Apps kustomization.yaml
+cat > clusters/dev/apps/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - sample-app.yaml
+EOF
+
+# Apps Kustomization
+cat > clusters/dev/apps.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/apps
+  prune: true
+  dependsOn:
+    - name: infrastructure
+EOF
+```
+
+### Step 5: Create Test Secret in AWS
+
+```bash
+# Create secret for the app
+aws secretsmanager create-secret \
+  --name dev/sample-app/database \
+  --secret-string '{"url": "postgresql://user:pass@localhost:5432/db"}'
+```
+
+### Step 6: Commit and Deploy
+
+```bash
+git add .
+git commit -m "Add sample-app application"
+git push
+```
+
+### Step 7: Watch Deployment
+
+```bash
+# Watch reconciliation
+flux get kustomizations -w
+
+# Check app deployment
+kubectl get pods -n sample-app
+kubectl get externalsecrets -n sample-app
+```
+
+## Testing and Validation
+
+### Application Health
+```bash
+# Check deployment
+kubectl get deploy -n sample-app
+
+# Check pods
+kubectl get pods -n sample-app
+
+# Check logs
+kubectl logs -n sample-app -l app.kubernetes.io/name=sample-app
+```
+
+### Secret Sync
+```bash
+# Check ExternalSecret
+kubectl get externalsecret -n sample-app
+
+# Verify K8s secret created
+kubectl get secret sample-app-secrets -n sample-app
+
+# Check secret data (base64 decoded)
+kubectl get secret sample-app-secrets -n sample-app -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+```
+
+### Service Connectivity
+```bash
+# Port forward to test
+kubectl port-forward -n sample-app svc/sample-app 8080:80
+
+# Test endpoint
+curl http://localhost:8080/healthz
+```
+
+## Updating Applications
+
+### Update Image Tag
+
+```bash
+# Edit overlay kustomization
+cd apps/sample-app/overlays/dev
+
+# Update image tag
+yq -i '.images[0].newTag = "v1.1.0"' kustomization.yaml
+
+git add .
+git commit -m "Update sample-app to v1.1.0"
+git push
+```
+
+### Add Environment Variable
+
+```bash
+# Create or update deployment patch
+cat >> apps/sample-app/overlays/dev/deployment-patch.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: NEW_FEATURE
+              value: "enabled"
+EOF
+
+# Update kustomization to include patch
+yq -i '.patches += [{"path": "deployment-patch.yaml"}]' apps/sample-app/overlays/dev/kustomization.yaml
+
+git add .
+git commit -m "Enable new feature in sample-app"
+git push
+```
+
+### Rollback
+
+```bash
+# Revert to previous commit
+git revert HEAD
+git push
+
+# Or force a specific version
+flux reconcile kustomization sample-app --with-source
+
+# Or suspend and manually rollback
+flux suspend kustomization sample-app
+kubectl rollout undo deployment/sample-app -n sample-app
+```
+
+## Troubleshooting
+
+### Pod Stuck in Pending
+
+**Check**:
+```bash
+kubectl describe pod -n sample-app POD_NAME
+```
+
+**Common Issues**:
+- Insufficient resources: Scale up nodes
+- Image pull failed: Check ECR cache, GHCR auth
+- PVC pending: Check storage class
+
+### Secret Not Created
+
+**Check**:
+```bash
+kubectl describe externalsecret sample-app-secrets -n sample-app
+```
+
+**Common Issues**:
+- Secret doesn't exist in Secrets Manager
+- ClusterSecretStore not ready
+- ESO role lacks permissions
+
+### Health Check Failing
+
+**Check**:
+```bash
+kubectl logs -n sample-app POD_NAME
+kubectl describe pod -n sample-app POD_NAME
+```
+
+**Common Issues**:
+- Wrong health endpoint path
+- Application crash on startup
+- Missing environment variables
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| 2 pods (256Mi each) | ~$1 | Shared node resources |
+| Secrets Manager | $0.40/secret | Per secret/month |
+| ECR (cached images) | ~$1 | Storage |
+| **Total per app** | ~$3/month | Minimal footprint |
+
+## Security Best Practices
+
+1. **runAsNonRoot**: Don't run as root
+2. **readOnlyRootFilesystem**: Prevent writes to container FS
+3. **Resource limits**: Prevent resource exhaustion
+4. **IRSA**: Pod-level AWS permissions
+5. **ExternalSecrets**: No secrets in Git
+6. **Network policies**: (Future) Restrict pod communication
+
+## Files Created
+
+```
+apps/
+└── sample-app/
+    ├── base/
+    │   ├── kustomization.yaml
+    │   ├── namespace.yaml
+    │   ├── serviceaccount.yaml
+    │   ├── externalsecret.yaml
+    │   ├── deployment.yaml
+    │   └── service.yaml
+    └── overlays/
+        └── dev/
+            ├── kustomization.yaml
+            └── serviceaccount-patch.yaml
+
+clusters/dev/
+├── apps/
+│   ├── kustomization.yaml
+│   └── sample-app.yaml
+└── apps.yaml
+```
+
+## Dependencies
+
+- **Depends on**: Module 7 (Core Platform - ESO must be running)
+- **Required by**: None (final module)
+
+## Complete!
+
+Congratulations! You have completed the EKS GitOps platform setup.
+
+**What you've built**:
+1. VPC with private subnets and VPC endpoints
+2. EKS cluster with managed node groups
+3. IRSA for secure AWS access
+4. ECR pull-through cache for GHCR
+5. FluxCD GitOps with GitHub App auth
+6. External Secrets Operator for secrets sync
+7. CloudWatch observability
+8. Sample application deployment
+
+**Next steps**:
+- Add more applications following the sample-app pattern
+- Configure FortiWeb ingress
+- Set up monitoring dashboards
+- Implement network policies
+- Add more environments (staging, prod)

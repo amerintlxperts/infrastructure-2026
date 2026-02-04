@@ -1,0 +1,584 @@
+================================================================================
+MODULE 6: FLUXCD BOOTSTRAP SPECIFICATION
+================================================================================
+
+## Overview
+
+This module bootstraps FluxCD onto the EKS cluster, configuring it to sync
+from the gitops-platform GitHub repository using GitHub App authentication.
+FluxCD provides GitOps-based continuous delivery.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           FluxCD Architecture                               │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                         GitHub (amerintlxperts)                                │  │
+│  │                                                                        │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  gitops-platform repository                                      │  │  │
+│  │  │                                                                  │  │  │
+│  │  │  clusters/                                                       │  │  │
+│  │  │    dev/                                                          │  │  │
+│  │  │      flux-system/           ◄── FluxCD self-manages here        │  │  │
+│  │  │        gotk-components.yaml                                      │  │  │
+│  │  │        gotk-sync.yaml                                            │  │  │
+│  │  │        kustomization.yaml                                        │  │  │
+│  │  │      infrastructure/        ◄── Platform components              │  │  │
+│  │  │        sources.yaml                                              │  │  │
+│  │  │        external-secrets.yaml                                     │  │  │
+│  │  │        cloudwatch.yaml                                           │  │  │
+│  │  │      apps/                  ◄── Application references           │  │  │
+│  │  │        app1.yaml                                                 │  │  │
+│  │  │        app2.yaml                                                 │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  │                                      │                                 │  │
+│  │  GitHub App: amerintlxperts-fluxcd           │ Read access                    │  │
+│  │  - App ID: 123456                    │                                 │  │
+│  │  - Installation ID: 12345678         │                                 │  │
+│  │  - Private key in Secrets Manager    ▼                                 │  │
+│  └──────────────────────────────────────┼─────────────────────────────────┘  │
+│                                         │                                   │
+│  ┌──────────────────────────────────────▼─────────────────────────────────┐  │
+│  │                         EKS Cluster                                    │  │
+│  │                                                                        │  │
+│  │  namespace: flux-system                                                │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │                                                                  │  │  │
+│  │  │  ┌────────────────┐   ┌────────────────┐   ┌────────────────┐  │  │  │
+│  │  │  │    Source      │   │   Kustomize    │   │     Helm       │  │  │  │
+│  │  │  │   Controller   │   │   Controller   │   │   Controller   │  │  │  │
+│  │  │  │                │   │                │   │                │  │  │  │
+│  │  │  │ Polls GitHub   │──►│ Applies K8s    │   │ Installs Helm  │  │  │  │
+│  │  │  │ for changes    │   │ manifests      │   │ charts         │  │  │  │
+│  │  │  └────────────────┘   └────────────────┘   └────────────────┘  │  │  │
+│  │  │                                                                  │  │  │
+│  │  │  ┌────────────────┐                                              │  │  │
+│  │  │  │  Notification  │   Sends alerts to Slack/Teams/webhooks      │  │  │
+│  │  │  │   Controller   │                                              │  │  │
+│  │  │  └────────────────┘                                              │  │  │
+│  │  │                                                                  │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                        │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **FluxCD Components**
+   - Source Controller (Git, Helm repos)
+   - Kustomize Controller (Kustomize/plain YAML)
+   - Helm Controller (Helm releases)
+   - Notification Controller (alerts)
+
+2. **GitOps Workflow**
+   - Pull-based deployment model
+   - Reconciliation loop
+   - Drift detection and correction
+
+3. **GitHub App Authentication**
+   - App vs PAT vs Deploy Key
+   - Token generation and rotation
+   - Permission scoping
+
+4. **Repository Structure**
+   - Cluster-specific paths
+   - Infrastructure vs application separation
+   - Kustomize overlays
+
+## Component Deep Dive
+
+### 1. GitHub App Credentials Setup
+
+**Store credentials in Secrets Manager** (done in Module 4):
+```bash
+# Create secret for GitHub App
+aws secretsmanager create-secret \
+  --name "${PROJECT}-${ENV}/github-app" \
+  --secret-string '{
+    "app_id": "123456",
+    "installation_id": "12345678"
+  }'
+
+# Store private key separately
+aws secretsmanager create-secret \
+  --name "${PROJECT}-${ENV}/github-app-private-key" \
+  --secret-string "$(cat private-key.pem)"
+```
+
+### 2. FluxCD Bootstrap
+
+**Purpose**: Install FluxCD and configure GitHub sync
+
+The bootstrap process:
+1. Installs FluxCD components in cluster
+2. Creates `GitRepository` pointing to gitops-platform
+3. Creates `Kustomization` pointing to `clusters/dev`
+4. Commits FluxCD manifests back to the repository
+5. FluxCD begins self-managing from Git
+
+**Bootstrap Command**:
+```bash
+flux bootstrap github \
+  --owner=amerintlxperts \
+  --repository=gitops-platform \
+  --branch=main \
+  --path=clusters/dev \
+  --personal=false \
+  --github-app-id=${GITHUB_APP_ID} \
+  --github-app-installation-id=${GITHUB_APP_INSTALLATION_ID} \
+  --github-app-private-key-path=/tmp/github-app-key.pem \
+  --components-extra=image-reflector-controller,image-automation-controller
+```
+
+**Bootstrap Options Explained**:
+
+| Option | Value | Purpose |
+|--------|-------|---------|
+| `--owner` | amerintlxperts | GitHub organization |
+| `--repository` | gitops-platform | Repository name |
+| `--branch` | main | Branch to sync from |
+| `--path` | clusters/dev | Path in repo for this cluster |
+| `--personal=false` | - | Use org repo, not personal |
+| `--github-app-*` | - | GitHub App credentials |
+| `--components-extra` | image-* | Optional: image automation |
+
+### 3. Generated Repository Structure
+
+After bootstrap, `gitops-platform` will have:
+
+```
+gitops-platform/
+├── clusters/
+│   └── dev/
+│       └── flux-system/
+│           ├── gotk-components.yaml    # FluxCD component manifests
+│           ├── gotk-sync.yaml          # GitRepository + Kustomization
+│           └── kustomization.yaml      # Kustomize entry point
+└── README.md
+```
+
+**gotk-sync.yaml** (auto-generated):
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 1m
+  ref:
+    branch: main
+  secretRef:
+    name: flux-system
+  url: https://github.com/amerintlxperts/gitops-platform
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./clusters/dev
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+```
+
+### 4. Infrastructure Kustomization
+
+**Purpose**: Deploy platform components (ESO, observability)
+
+Create `clusters/dev/infrastructure.yaml`:
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  interval: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/infrastructure
+  prune: true
+  wait: true
+  timeout: 5m
+```
+
+### 5. Apps Kustomization
+
+**Purpose**: Deploy applications after infrastructure is ready
+
+Create `clusters/dev/apps.yaml`:
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/apps
+  prune: true
+  wait: true
+  dependsOn:
+    - name: infrastructure  # Wait for ESO, etc.
+```
+
+### 6. External Helm Repositories
+
+**Purpose**: Reference external Helm charts
+
+Create `clusters/dev/infrastructure/sources.yaml`:
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: external-secrets
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://charts.external-secrets.io
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: eks-charts
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://aws.github.io/eks-charts
+```
+
+## Step-by-Step Implementation
+
+### Step 1: Prerequisites
+
+Ensure you have:
+- [ ] EKS cluster running (Module 2-3)
+- [ ] kubectl configured for cluster
+- [ ] Flux CLI installed
+- [ ] GitHub App created in amerintlxperts org
+- [ ] GitHub App private key stored in Secrets Manager
+
+### Step 2: Retrieve GitHub App Credentials
+
+```bash
+# Get App ID and Installation ID
+APP_CONFIG=$(aws secretsmanager get-secret-value \
+  --secret-id ${PROJECT}-${ENV}/github-app \
+  --query SecretString --output text)
+
+export GITHUB_APP_ID=$(echo $APP_CONFIG | jq -r '.app_id')
+export GITHUB_APP_INSTALLATION_ID=$(echo $APP_CONFIG | jq -r '.installation_id')
+
+# Get private key
+aws secretsmanager get-secret-value \
+  --secret-id ${PROJECT}-${ENV}/github-app-private-key \
+  --query SecretString --output text > /tmp/github-app-key.pem
+```
+
+### Step 3: Run Bootstrap
+
+```bash
+flux bootstrap github \
+  --owner=amerintlxperts \
+  --repository=gitops-platform \
+  --branch=main \
+  --path=clusters/dev \
+  --personal=false \
+  --github-app-id=${GITHUB_APP_ID} \
+  --github-app-installation-id=${GITHUB_APP_INSTALLATION_ID} \
+  --github-app-private-key-path=/tmp/github-app-key.pem
+
+# Clean up private key
+rm /tmp/github-app-key.pem
+```
+
+### Step 4: Verify Installation
+
+```bash
+# Check FluxCD components
+flux get all
+
+# Check pods
+kubectl get pods -n flux-system
+
+# Check GitRepository sync
+flux get sources git
+
+# Check Kustomization status
+flux get kustomizations
+```
+
+### Step 5: Create Infrastructure Directory
+
+Clone the gitops-platform repo and add infrastructure:
+
+```bash
+cd gitops-platform
+
+# Create infrastructure directory
+mkdir -p clusters/dev/infrastructure
+
+# Create Helm repositories
+cat > clusters/dev/infrastructure/sources.yaml << 'EOF'
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: external-secrets
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://charts.external-secrets.io
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: eks-charts
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://aws.github.io/eks-charts
+EOF
+
+# Create kustomization file
+cat > clusters/dev/infrastructure/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - sources.yaml
+EOF
+
+# Add infrastructure Kustomization to cluster
+cat > clusters/dev/infrastructure.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  interval: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/infrastructure
+  prune: true
+  wait: true
+EOF
+
+git add .
+git commit -m "Add infrastructure base"
+git push
+```
+
+### Step 6: Wait for Reconciliation
+
+```bash
+# Watch reconciliation
+flux get kustomizations -w
+
+# Check HelmRepositories
+flux get sources helm
+```
+
+## Post-Bootstrap Repository Structure
+
+```
+gitops-platform/
+├── clusters/
+│   └── dev/
+│       ├── flux-system/           # Auto-generated, don't modify
+│       │   ├── gotk-components.yaml
+│       │   ├── gotk-sync.yaml
+│       │   └── kustomization.yaml
+│       ├── infrastructure/        # Platform components
+│       │   ├── kustomization.yaml
+│       │   ├── sources.yaml       # Helm repositories
+│       │   ├── external-secrets/  # ESO installation
+│       │   └── cloudwatch/        # Observability
+│       ├── apps/                  # Application references
+│       ├── infrastructure.yaml    # Infrastructure Kustomization
+│       └── apps.yaml              # Apps Kustomization (add later)
+└── apps/                          # Application definitions
+    └── app-name/
+        ├── base/
+        └── overlays/dev/
+```
+
+## Testing and Validation
+
+### FluxCD Health Check
+```bash
+# Overall status
+flux check
+
+# Expected output:
+# ✔ Kubernetes 1.31.x >= 1.26.0
+# ✔ prerequisites checks passed
+# ✔ source-controller: deployment ready
+# ✔ kustomize-controller: deployment ready
+# ✔ helm-controller: deployment ready
+# ✔ notification-controller: deployment ready
+```
+
+### Git Sync Status
+```bash
+# Check source sync
+flux get sources git
+
+# Expected:
+# NAME        REVISION     SUSPENDED  READY  MESSAGE
+# flux-system main@sha1:xxx False     True   stored artifact...
+```
+
+### Reconciliation Status
+```bash
+# Check all kustomizations
+flux get kustomizations -A
+
+# Force reconciliation
+flux reconcile kustomization flux-system --with-source
+```
+
+### Debug Logs
+```bash
+# Source controller logs
+kubectl logs -n flux-system deploy/source-controller
+
+# Kustomize controller logs
+kubectl logs -n flux-system deploy/kustomize-controller
+```
+
+## Troubleshooting
+
+### Bootstrap Fails with Auth Error
+
+**Error**: `authentication required` or `permission denied`
+
+**Check**:
+```bash
+# Verify GitHub App is installed on repository
+# Go to: GitHub > amerintlxperts > Settings > GitHub Apps > amerintlxperts-fluxcd
+# Check: Repository access includes gitops-platform
+
+# Test authentication
+gh api /app/installations/${GITHUB_APP_INSTALLATION_ID}/repositories
+```
+
+**Solutions**:
+- Ensure GitHub App has repository contents: read permission
+- Verify App is installed on gitops-platform repository
+- Check private key matches the App
+
+### Reconciliation Stuck
+
+**Symptoms**: Kustomization shows "progressing" indefinitely
+
+**Check**:
+```bash
+# Check events
+kubectl describe kustomization flux-system -n flux-system
+
+# Check controller logs
+kubectl logs -n flux-system deploy/kustomize-controller | tail -50
+```
+
+**Solutions**:
+- Invalid YAML in repository
+- Missing dependencies (dependsOn not ready)
+- Resource validation failure
+
+### Secret Not Found
+
+**Error**: `Secret "flux-system" not found`
+
+**Check**:
+```bash
+# Verify secret exists
+kubectl get secret flux-system -n flux-system
+
+# Check secret contents
+kubectl get secret flux-system -n flux-system -o yaml
+```
+
+**Solutions**:
+- Re-run bootstrap if secret was deleted
+- Ensure bootstrap completed successfully
+
+## Terraform Integration (Optional)
+
+For fully automated bootstrap, use the Flux Terraform provider:
+
+```hcl
+# Not required - bootstrap can be manual
+# But useful for reproducibility
+
+provider "flux" {
+  kubernetes = {
+    config_path = "~/.kube/config"
+  }
+  git = {
+    url = "https://github.com/amerintlxperts/gitops-platform"
+    http = {
+      username = "x-access-token"
+      password = var.github_app_token
+    }
+  }
+}
+
+resource "flux_bootstrap_git" "main" {
+  path = "clusters/dev"
+}
+```
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| FluxCD pods | ~$0.50 | Minimal CPU/memory |
+| GitHub API | Free | Within free tier |
+| **Total** | ~$0.50/month | Negligible |
+
+## Security Considerations
+
+1. **GitHub App over PAT**: Fine-grained, rotatable, auditable
+2. **Read-only access**: FluxCD only needs read access to Git
+3. **Namespace isolation**: Controllers run in flux-system namespace
+4. **RBAC**: FluxCD uses dedicated service accounts
+5. **Secret encryption**: Git credentials encrypted in cluster
+
+## Files Created
+
+After bootstrap:
+```
+clusters/dev/
+├── flux-system/              # Auto-generated by bootstrap
+│   ├── gotk-components.yaml
+│   ├── gotk-sync.yaml
+│   └── kustomization.yaml
+└── infrastructure.yaml       # Manually created
+```
+
+## Dependencies
+
+- **Depends on**: Module 2 (EKS), Module 3 (Nodes)
+- **Required by**: Module 7 (Core Platform), Module 8 (Applications)
+
+## Next Module
+
+After completing this module, proceed to:
+**Module 7: Core Platform** - Deploys External Secrets Operator and
+observability components via FluxCD.

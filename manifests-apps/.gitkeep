@@ -1,0 +1,9 @@
+# This directory contains application manifests.
+# Add subdirectories for each application.
+#
+# Example:
+#   manifests-apps/
+#   └── my-app/
+#       ├── deployment.yaml
+#       ├── service.yaml
+#       └── ingress.yaml

@@ -1,0 +1,167 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 1 - VPC & NETWORKING
+================================================================================
+
+## Task
+
+Implement the VPC and networking infrastructure for the EKS cluster using
+Terraform. Create a reusable module following AWS and Terraform best practices.
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Region: ca-central-1
+- Environment: dev
+- Specification: See `spec/module1_vpc_networking.txt` for full details
+
+## Prerequisites
+
+- [ ] AWS CLI configured with appropriate credentials
+- [ ] Terraform >= 1.5 installed
+- [ ] S3 bucket for Terraform state: `amerintlxperts-terraform-state-ca-central-1`
+- [ ] DynamoDB table for state locking: `amerintlxperts-terraform-locks`
+
+## Deliverables
+
+Create the following structure:
+
+```
+terraform/
+├── environments/
+│   └── dev/
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── terraform.tfvars
+│       └── versions.tf
+└── modules/
+    └── vpc/
+        ├── main.tf           # VPC, subnets, gateways, routes
+        ├── endpoints.tf      # VPC endpoints
+        ├── security_groups.tf # Security groups
+        ├── variables.tf
+        ├── outputs.tf
+        └── README.md
+```
+
+## Implementation Requirements
+
+### 1. VPC Configuration
+
+```hcl
+# VPC: 10.0.0.0/16
+# DNS hostnames: enabled (required for EKS)
+# DNS support: enabled (required for VPC endpoints)
+```
+
+### 2. Subnet Layout
+
+| Subnet | CIDR | AZ | Type | Purpose |
+|--------|------|-----|------|---------|
+| public-a | 10.0.1.0/24 | ca-central-1a | Public | NAT, FortiWeb |
+| public-b | 10.0.2.0/24 | ca-central-1b | Public | HA (future) |
+| private-a | 10.0.10.0/24 | ca-central-1a | Private | EKS nodes |
+| private-b | 10.0.11.0/24 | ca-central-1b | Private | EKS nodes |
+| endpoints | 10.0.100.0/24 | ca-central-1a | Private | VPC endpoints |
+
+### 3. Required EKS Tags
+
+```hcl
+# All subnets
+"kubernetes.io/cluster/xperts-dev" = "shared"
+
+# Public subnets (for internet-facing LBs)
+"kubernetes.io/role/elb" = "1"
+
+# Private subnets (for internal LBs)
+"kubernetes.io/role/internal-elb" = "1"
+```
+
+### 4. VPC Endpoints
+
+Create these endpoints for private AWS access:
+
+| Endpoint | Type | Notes |
+|----------|------|-------|
+| ecr.api | Interface | ECR API calls |
+| ecr.dkr | Interface | Docker registry |
+| s3 | Gateway | Free, ECR layers |
+| secretsmanager | Interface | ESO access |
+| sts | Interface | IRSA |
+| logs | Interface | CloudWatch Logs |
+| ec2 | Interface | Node management |
+
+### 5. Security Groups
+
+**VPC Endpoints Security Group**:
+- Ingress: 443 from private subnets
+- No egress rules needed
+
+## Terraform Patterns to Follow
+
+### Use locals for configuration
+```hcl
+locals {
+  vpc_cidr = "10.0.0.0/16"
+  cluster_name = "${var.project_name}-${var.environment}"
+
+  subnets = {
+    "public-a" = { cidr = "10.0.1.0/24", az = "a", public = true }
+    # ...
+  }
+}
+```
+
+### Use for_each for DRY resources
+```hcl
+resource "aws_subnet" "main" {
+  for_each = local.subnets
+  # ...
+}
+```
+
+### Include educational comments
+```hcl
+# LEARNING NOTE: VPC endpoints allow private access to AWS services
+# without traversing the internet, improving security and reducing
+# data transfer costs through NAT Gateway.
+```
+
+## Testing
+
+After applying:
+
+```bash
+# Verify VPC
+aws ec2 describe-vpcs --filters "Name=tag:Name,Values=xperts-dev-vpc"
+
+# Verify subnets
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=VPC_ID"
+
+# Verify endpoints
+aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=VPC_ID"
+```
+
+## Expected Outputs
+
+```hcl
+output "vpc_id" {}
+output "private_subnet_ids" {}
+output "public_subnet_ids" {}
+output "vpc_endpoints_security_group_id" {}
+```
+
+## Constraints
+
+- Single NAT Gateway (cost optimization for dev)
+- Use gp3 volumes if creating any EC2
+- Tag all resources with project/environment
+- No hardcoded values - use variables
+
+## Reference
+
+- Full specification: `spec/module1_vpc_networking.txt`
+- Architecture diagrams: `architecture/diagrams/network-architecture.md`
+- ADR: N/A (networking is foundational)
+
+================================================================================

@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - external-secret.yaml
+  - landing-page/deployment.yaml
+  - landing-page/service.yaml
+  - landing-page-canada/deployment.yaml
+  - landing-page-canada/service.yaml
+  - landing-page-latam/deployment.yaml
+  - landing-page-latam/service.yaml
+  - secops/configmap.yaml
+  - secops/deployment.yaml
+  - secops/service.yaml
+  - secops-canada/deployment.yaml
+  - secops-canada/service.yaml
+  - secops-latam/deployment.yaml
+  - secops-latam/service.yaml
+  - ai/configmap.yaml
+  - ai/deployment.yaml
+  - ai/service.yaml
+  - ai-canada/deployment.yaml
+  - ai-canada/service.yaml
+  - ai-latam/deployment.yaml
+  - ai-latam/service.yaml
+  - enterprise-protection/configmap.yaml
+  - enterprise-protection/deployment.yaml
+  - enterprise-protection/service.yaml
+  - enterprise-protection-canada/deployment.yaml
+  - enterprise-protection-canada/service.yaml
+  - enterprise-protection-latam/deployment.yaml
+  - enterprise-protection-latam/service.yaml

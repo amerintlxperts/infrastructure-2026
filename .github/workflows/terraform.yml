@@ -1,0 +1,136 @@
+# =============================================================================
+# Terraform CI/CD Pipeline
+# =============================================================================
+# Manual dispatch workflow for terraform plan and apply.
+# Uses OIDC for keyless AWS authentication (no long-lived secrets).
+# =============================================================================
+
+name: Terraform
+
+on:
+  workflow_dispatch:  # Manual runs only
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+  pull-requests: write  # For PR comments
+
+env:
+  TF_VERSION: '1.5'
+  TF_WORKING_DIR: 'terraform/environments/dev'
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    env:
+      # Pass admin CIDR to Terraform for security group rules
+      TF_VAR_admin_cidr: ${{ secrets.TF_VAR_admin_cidr }}
+      # Pass admin role ARN for EKS kubectl access
+      TF_VAR_admin_role_arn: ${{ secrets.TF_VAR_admin_role_arn }}
+      # Pass additional cluster admin ARNs (JSON array)
+      TF_VAR_additional_cluster_admins: ${{ secrets.TF_VAR_additional_cluster_admins }}
+      # Pass FortiFlex token for FortiWeb licensing (optional)
+      TF_VAR_fortiflex_token: ${{ secrets.TF_VAR_fortiflex_token }}
+      # DNS configuration
+      TF_VAR_domain_name: ${{ secrets.TF_VAR_domain_name }}
+      TF_VAR_acme_email: ${{ secrets.TF_VAR_acme_email }}
+      # Route53 delegation set for consistent nameservers
+      TF_VAR_delegation_set_id: ${{ secrets.TF_VAR_DELEGATION_SET_ID }}
+
+    steps:
+      # ---------------------------------------------------------------------
+      # Checkout & Setup
+      # ---------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      # ---------------------------------------------------------------------
+      # Terraform Init & Validate
+      # ---------------------------------------------------------------------
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -diff
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      # ---------------------------------------------------------------------
+      # Terraform Plan
+      # ---------------------------------------------------------------------
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "plan_exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      # Comment plan on PR
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan_output.txt', 'utf8');
+
+            // Truncate if too long
+            const maxLength = 60000;
+            const truncated = planOutput.length > maxLength
+              ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
+              : planOutput;
+
+            const body = `## Terraform Plan
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Check Plan Status
+        if: steps.plan.outputs.plan_exitcode != '0'
+        run: exit 1
+
+      # ---------------------------------------------------------------------
+      # Terraform Apply (main branch only)
+      # ---------------------------------------------------------------------
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan

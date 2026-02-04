@@ -1,0 +1,223 @@
+================================================================================
+PROJECT OVERVIEW: EKS GITOPS PLATFORM
+================================================================================
+
+## Project Goal
+
+Build a production-ready Kubernetes platform on Amazon EKS with GitOps-based
+continuous delivery using FluxCD. The platform enables deploying containerized
+applications from GitHub Container Registry with secure AWS service integration.
+
+## Target Architecture
+
+```
+GitHub (amerintlxperts org)                     AWS (ca-central-1)
+┌────────────────────┐                 ┌─────────────────────────────────────┐
+│                    │                 │              VPC                     │
+│  eks-infrastructure│─── Terraform ──►│  ┌─────────────────────────────────┐│
+│  (Terraform)       │                 │  │         EKS Cluster              ││
+│                    │                 │  │                                  ││
+│  gitops-platform   │─── FluxCD ─────►│  │  ┌────────┐  ┌────────────────┐││
+│  (Manifests)       │                 │  │  │Managed │  │ Platform Pods  │││
+│                    │                 │  │  │ Nodes  │  │ - FluxCD       │││
+│  GHCR              │─── ECR Cache ──►│  │  │        │  │ - ESO          │││
+│  (Container Images)│                 │  │  │        │  │ - CloudWatch   │││
+└────────────────────┘                 │  │  │        │  │ - Apps         │││
+                                       │  │  └────────┘  └────────────────┘││
+                                       │  └─────────────────────────────────┘│
+                                       │                                     │
+                                       │  AWS Services: Secrets Manager,     │
+                                       │  CloudWatch, ECR, IAM               │
+                                       └─────────────────────────────────────┘
+```
+
+## Key Decisions Summary
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| AWS Region | ca-central-1 | User requirement |
+| EKS Version | 1.31 | Latest stable |
+| Node Strategy | Managed Node Groups | Operational simplicity |
+| Compute | t3.medium (1-2 nodes) | Cost-optimized for dev |
+| AWS Auth | IRSA | Pod-level permissions |
+| GitOps Tool | FluxCD | Headless, GitOps native |
+| Git Auth | GitHub App | Fine-grained, rotatable |
+| Registry | ECR pull-through cache | Fast pulls, resilience |
+| Secrets | External Secrets + SM | No secrets in Git |
+| Observability | CloudWatch | Low overhead, AWS native |
+| Ingress | FortiWeb | Organizational standard |
+| Repo Structure | Hybrid | Terraform + GitOps separate |
+
+## Repository Structure
+
+**Repository 1: `amerintlxperts/eks-infrastructure`** (Terraform)
+```
+eks-infrastructure/
+├── terraform/
+│   ├── environments/dev/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   └── terraform.tfvars
+│   └── modules/
+│       ├── vpc/
+│       ├── eks/
+│       ├── node-groups/
+│       ├── ecr/
+│       └── irsa/
+├── scripts/
+└── README.md
+```
+
+**Repository 2: `amerintlxperts/gitops-platform`** (FluxCD)
+```
+gitops-platform/
+├── clusters/dev/
+│   ├── flux-system/           # FluxCD components (auto-managed)
+│   ├── infrastructure/        # Platform components (ESO, CW)
+│   │   ├── external-secrets/
+│   │   ├── cloudwatch/
+│   │   └── fluent-bit/
+│   └── apps/                  # Application references
+├── apps/
+│   └── sample-app/
+│       ├── base/
+│       └── overlays/dev/
+└── README.md
+```
+
+## Module Dependency Order
+
+```
+Module 1: VPC & Networking
+    │
+    ├──► Module 2: EKS Cluster
+    │        │
+    │        ├──► Module 3: Node Groups
+    │        │        │
+    │        │        └──► Module 6: FluxCD Bootstrap ──► Module 7: Core Platform ──► Module 8: Apps
+    │        │
+    │        └──► Module 5: IAM & IRSA
+    │
+    └──► Module 4: ECR & Registry
+```
+
+## Implementation Phases
+
+### Phase 1: Infrastructure (Terraform)
+- Module 1: VPC with subnets, NAT, VPC endpoints
+- Module 2: EKS cluster with OIDC provider
+- Module 3: Managed node groups
+- Module 4: ECR pull-through cache for GHCR
+- Module 5: IRSA roles for platform components
+
+### Phase 2: GitOps Bootstrap
+- Module 6: Install FluxCD, configure GitHub App auth
+- Create gitops-platform repository structure
+
+### Phase 3: Platform Components
+- Module 7: Deploy ESO, CloudWatch, Fluent Bit via FluxCD
+
+### Phase 4: Applications
+- Module 8: Deploy sample application with secrets integration
+
+## Prerequisites
+
+### Tools Required
+- AWS CLI v2
+- Terraform >= 1.5
+- kubectl matching EKS version
+- Flux CLI v2
+- git
+
+### AWS Permissions
+- IAM permissions to create VPC, EKS, IAM roles, ECR, Secrets Manager
+- Access to ca-central-1 region
+
+### GitHub Requirements
+- Admin access to amerintlxperts organization
+- Ability to create GitHub App
+- Repository creation permissions
+
+## Configuration Values
+
+These values should be customized per deployment:
+
+| Variable | Example | Where Used |
+|----------|---------|------------|
+| project_name | amerintlxperts | All resources |
+| environment | dev | All resources |
+| aws_region | ca-central-1 | Terraform, FluxCD |
+| github_org | amerintlxperts | FluxCD, ECR |
+| vpc_cidr | 10.0.0.0/16 | VPC module |
+| eks_version | 1.31 | EKS module |
+| node_instance_types | ["t3.medium"] | Node groups |
+| node_desired_size | 2 | Node groups |
+
+## Cost Estimate
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| EKS Control Plane | $73 |
+| EC2 Nodes (2x t3.medium) | ~$60 |
+| NAT Gateway | ~$32 |
+| VPC Endpoints | ~$52 |
+| ECR Storage | ~$5 |
+| CloudWatch | ~$10 |
+| Secrets Manager | ~$2 |
+| **Total** | **~$234/month** |
+
+Cost optimization options:
+- Spot instances: Save ~40% on EC2
+- Scale to zero when not in use
+- Single NAT gateway (vs HA)
+
+## Success Criteria
+
+1. [ ] EKS cluster accessible via kubectl
+2. [ ] Nodes registered and ready
+3. [ ] FluxCD syncing from GitHub
+4. [ ] External Secrets syncing from Secrets Manager
+5. [ ] CloudWatch Container Insights showing metrics
+6. [ ] Logs appearing in CloudWatch Logs
+7. [ ] Sample app deployed and running
+8. [ ] Image pulled via ECR cache
+
+## Reference Documentation
+
+- Architecture Overview: `architecture/README.md`
+- ADRs: `architecture/adr/`
+- System Diagrams: `architecture/diagrams/`
+- Module Specifications: `spec/module*.txt`
+- Getting Started: `architecture/guides/getting-started.md`
+- Troubleshooting: `architecture/guides/troubleshooting.md`
+
+## Implementation Prompts
+
+Use the module-specific prompts in `prompts/` directory:
+- `module1-vpc.txt` - VPC & Networking
+- `module2-eks.txt` - EKS Cluster
+- `module3-nodes.txt` - Node Groups
+- `module4-ecr.txt` - ECR & Registry
+- `module5-irsa.txt` - IAM & IRSA
+- `module6-fluxcd.txt` - FluxCD Bootstrap
+- `module7-platform.txt` - Core Platform
+- `module8-apps.txt` - Applications
+
+## Key Constraints
+
+1. **Documentation only this phase** - No code changes until approved
+2. **Cost optimization** - Minimize costs for dev environment
+3. **Security first** - IRSA, no secrets in Git, encrypted storage
+4. **GitOps native** - All cluster changes through Git
+5. **Educational** - Include learning comments in code
+
+## Next Steps
+
+1. Review this overview and architecture documentation
+2. Start with Module 1 (VPC & Networking) implementation
+3. Follow module dependency order
+4. Test each module before proceeding
+5. Document any deviations or issues
+
+================================================================================

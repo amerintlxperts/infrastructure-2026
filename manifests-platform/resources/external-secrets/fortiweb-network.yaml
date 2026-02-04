@@ -1,0 +1,55 @@
+# =============================================================================
+# FortiWeb Network Config - External Secret
+# =============================================================================
+# Syncs FortiWeb network configuration (IPs) from AWS Secrets Manager to a
+# Kubernetes secret. Used by Ingress resources for FortiWeb annotations.
+#
+# The secret is created by Terraform with FortiWeb's dynamic IPs:
+#   - FORTIWEB_IP: Private IP of port2 (for API connection from pods)
+#   - FORTIWEB_PUBLIC_IP: Public IP (for virtual server VIP)
+#   - FORTIWEB_PORT1_IP: Private IP of port1 (for virtual server interface)
+#   - FORTIWEB_PORT: API port (8443)
+#   - instance_id: EC2 instance ID (default password for bootstrap)
+# =============================================================================
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fortiweb-network
+  namespace: kube-system
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: fortiweb-config
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        FORTIWEB_IP: "{{ .FORTIWEB_IP }}"
+        FORTIWEB_PUBLIC_IP: "{{ .FORTIWEB_PUBLIC_IP }}"
+        FORTIWEB_PORT1_IP: "{{ .FORTIWEB_PORT1_IP }}"
+        FORTIWEB_PORT: "{{ .FORTIWEB_PORT }}"
+        instance_id: "{{ .instance_id }}"
+  data:
+    - secretKey: FORTIWEB_IP
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_IP
+    - secretKey: FORTIWEB_PUBLIC_IP
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_PUBLIC_IP
+    - secretKey: FORTIWEB_PORT1_IP
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_PORT1_IP
+    - secretKey: FORTIWEB_PORT
+      remoteRef:
+        key: dev/fortiweb-network
+        property: FORTIWEB_PORT
+    - secretKey: instance_id
+      remoteRef:
+        key: dev/fortiweb-network
+        property: instance_id

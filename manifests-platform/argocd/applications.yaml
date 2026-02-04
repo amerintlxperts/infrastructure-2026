@@ -1,0 +1,53 @@
+# =============================================================================
+# Applications
+# =============================================================================
+# Points to the manifests-apps/ directory where your actual applications live.
+# Each subdirectory in manifests-apps/ should contain Kubernetes manifests
+# for one application.
+#
+# STRUCTURE:
+# ----------
+#   manifests-apps/
+#   ├── api-gateway/
+#   │   ├── deployment.yaml
+#   │   ├── service.yaml
+#   │   └── ingress.yaml
+#   ├── web-frontend/
+#   │   └── ...
+#   └── background-worker/
+#       └── ...
+#
+# For Kustomize-based apps, use base/overlays structure:
+#   manifests-apps/
+#   └── my-app/
+#       ├── base/
+#       │   ├── kustomization.yaml
+#       │   └── deployment.yaml
+#       └── overlays/
+#           └── dev/
+#               └── kustomization.yaml
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: applications
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"  # Deploy apps last, after platform is ready
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:amerintlxperts/infrastructure-2026.git
+    path: manifests-apps
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

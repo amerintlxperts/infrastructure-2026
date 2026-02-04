@@ -1,0 +1,85 @@
+# =============================================================================
+# Terraform State Recovery - ONE TIME USE
+# =============================================================================
+# Use this to recover from a cancelled terraform apply that left state
+# out of sync with AWS. DELETE THIS FILE after use.
+# =============================================================================
+
+name: Terraform State Recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.5'
+  TF_WORKING_DIR: 'terraform/environments/dev'
+
+jobs:
+  recover:
+    name: Recover State
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_admin_cidr: ${{ secrets.TF_VAR_admin_cidr }}
+      TF_VAR_admin_role_arn: ${{ secrets.TF_VAR_admin_role_arn }}
+      TF_VAR_additional_cluster_admins: ${{ secrets.TF_VAR_additional_cluster_admins }}
+      TF_VAR_fortiflex_token: ${{ secrets.TF_VAR_fortiflex_token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      # Step 1: List current state
+      - name: Show Current State
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform state list || echo "State is empty"
+
+      # Step 2: Remove all items from state (AWS resources already deleted manually)
+      - name: Clear State
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          # Get all resources in state and remove them
+          terraform state list 2>/dev/null | while read resource; do
+            echo "Removing: $resource"
+            terraform state rm -lock=false "$resource" || true
+          done
+          echo "State cleared"
+
+      # Step 3: Verify state is empty
+      - name: Verify Empty State
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          count=$(terraform state list 2>/dev/null | wc -l)
+          echo "Resources remaining in state: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "State is now empty - ready for fresh deployment"
+          fi

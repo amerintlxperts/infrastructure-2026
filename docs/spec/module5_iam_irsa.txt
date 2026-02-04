@@ -1,0 +1,655 @@
+================================================================================
+MODULE 5: IAM & IRSA SPECIFICATION
+================================================================================
+
+## Overview
+
+This module creates IAM roles that can be assumed by Kubernetes service accounts
+using IAM Roles for Service Accounts (IRSA). This enables fine-grained AWS
+permissions at the pod level without storing credentials.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            IRSA Authentication Flow                          │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                         EKS Cluster                                    │  │
+│  │                                                                        │  │
+│  │  1. Pod with ServiceAccount                                           │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  apiVersion: v1                                                  │  │  │
+│  │  │  kind: ServiceAccount                                            │  │  │
+│  │  │  metadata:                                                       │  │  │
+│  │  │    name: my-app                                                  │  │  │
+│  │  │    annotations:                                                  │  │  │
+│  │  │      eks.amazonaws.com/role-arn: arn:aws:iam::123:role/my-app   │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  │                            │                                           │  │
+│  │                            │ 2. Token projected into pod              │  │
+│  │                            │    /var/run/secrets/eks.amazonaws.com/   │  │
+│  │                            │    serviceaccount/token                  │  │
+│  │                            ▼                                           │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  Pod Container                                                   │  │  │
+│  │  │                                                                  │  │  │
+│  │  │  AWS SDK reads:                                                  │  │  │
+│  │  │  - AWS_ROLE_ARN (injected env var)                              │  │  │
+│  │  │  - AWS_WEB_IDENTITY_TOKEN_FILE (injected env var)               │  │  │
+│  │  │                                                                  │  │  │
+│  │  │  SDK calls: sts:AssumeRoleWithWebIdentity                       │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                         │                                   │
+│                                         │ 3. JWT token + role ARN           │
+│                                         ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                              AWS STS                                  │  │
+│  │                                                                       │  │
+│  │  4. Validates JWT against OIDC provider                              │  │
+│  │     - Issuer matches EKS cluster OIDC                                │  │
+│  │     - Audience is "sts.amazonaws.com"                                │  │
+│  │     - Subject matches "system:serviceaccount:ns:sa"                  │  │
+│  │                                                                       │  │
+│  │  5. Returns temporary credentials (15min-12hr)                       │  │
+│  │     - AccessKeyId                                                    │  │
+│  │     - SecretAccessKey                                                │  │
+│  │     - SessionToken                                                   │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                         │                                   │
+│                                         │ 6. Pod uses credentials           │
+│                                         ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                           AWS Services                                │  │
+│  │                                                                       │  │
+│  │  Secrets Manager  │  S3  │  SageMaker  │  DynamoDB  │  etc.         │  │
+│  │                                                                       │  │
+│  │  (Access controlled by IAM policy attached to role)                  │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **IRSA Mechanics**
+   - OIDC federation with IAM
+   - Token projection and rotation
+   - Trust policy conditions
+
+2. **IAM Role Design**
+   - Least privilege policies
+   - Resource-based conditions
+   - Cross-account access patterns
+
+3. **Service Account Patterns**
+   - One role per application
+   - Shared roles for common access
+   - Namespace isolation
+
+4. **Debugging IRSA**
+   - Token verification
+   - AssumeRole troubleshooting
+   - CloudTrail analysis
+
+## Component Deep Dive
+
+### 1. IRSA Role Pattern
+
+**Purpose**: Create reusable pattern for IRSA roles
+
+```hcl
+locals {
+  oidc_issuer = replace(
+    data.aws_eks_cluster.main.identity[0].oidc[0].issuer,
+    "https://",
+    ""
+  )
+}
+
+# Reusable module for IRSA roles
+resource "aws_iam_role" "irsa" {
+  name = "${var.project_name}-${var.environment}-${var.role_name}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          # Must match exact namespace and service account
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:${var.namespace}:${var.service_account}"
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-${var.role_name}"
+  }
+}
+```
+
+**Trust Policy Conditions Explained**:
+
+| Condition | Purpose |
+|-----------|---------|
+| `:sub` match | Restricts to specific namespace:serviceaccount |
+| `:aud` match | Ensures token was requested for STS |
+
+### 2. External Secrets Operator Role
+
+**Purpose**: Allow ESO to read secrets from Secrets Manager
+
+```hcl
+resource "aws_iam_role" "external_secrets" {
+  name = "${var.project_name}-${var.environment}-external-secrets"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:external-secrets:external-secrets"
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "external_secrets" {
+  name = "secrets-manager-access"
+  role = aws_iam_role.external_secrets.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        # Restrict to secrets with specific prefix
+        Resource = "arn:aws:secretsmanager:${var.region}:${var.account_id}:secret:${var.environment}/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:ListSecrets"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+```
+
+### 3. CloudWatch Agent Role
+
+**Purpose**: Allow CloudWatch agent to write metrics/logs
+
+```hcl
+resource "aws_iam_role" "cloudwatch_agent" {
+  name = "${var.project_name}-${var.environment}-cloudwatch-agent"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent"
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
+  role       = aws_iam_role.cloudwatch_agent.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+```
+
+### 4. Fluent Bit Role
+
+**Purpose**: Allow Fluent Bit to write logs to CloudWatch
+
+```hcl
+resource "aws_iam_role" "fluent_bit" {
+  name = "${var.project_name}-${var.environment}-fluent-bit"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:amazon-cloudwatch:fluent-bit"
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "fluent_bit" {
+  name = "cloudwatch-logs-access"
+  role = aws_iam_role.fluent_bit.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ]
+      Resource = [
+        "arn:aws:logs:${var.region}:${var.account_id}:log-group:/aws/eks/${var.cluster_name}/*",
+        "arn:aws:logs:${var.region}:${var.account_id}:log-group:/aws/eks/${var.cluster_name}/*:*"
+      ]
+    }]
+  })
+}
+```
+
+### 5. Application Role Template
+
+**Purpose**: Template for application-specific roles
+
+```hcl
+# Example: Application that reads from S3 and writes to DynamoDB
+resource "aws_iam_role" "app_example" {
+  name = "${var.project_name}-${var.environment}-app-example"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:app-namespace:app-example"
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "app_example" {
+  name = "app-permissions"
+  role = aws_iam_role.app_example.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "S3Read"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::${var.bucket_name}",
+          "arn:aws:s3:::${var.bucket_name}/*"
+        ]
+      },
+      {
+        Sid    = "DynamoDBWrite"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:GetItem",
+          "dynamodb:Query"
+        ]
+        Resource = "arn:aws:dynamodb:${var.region}:${var.account_id}:table/${var.table_name}"
+      }
+    ]
+  })
+}
+```
+
+## Common Role Patterns
+
+### Read-Only S3 Access
+```hcl
+policy = jsonencode({
+  Version = "2012-10-17"
+  Statement = [{
+    Effect = "Allow"
+    Action = [
+      "s3:GetObject",
+      "s3:ListBucket"
+    ]
+    Resource = [
+      "arn:aws:s3:::bucket-name",
+      "arn:aws:s3:::bucket-name/*"
+    ]
+  }]
+})
+```
+
+### Secrets Manager Access
+```hcl
+policy = jsonencode({
+  Version = "2012-10-17"
+  Statement = [{
+    Effect = "Allow"
+    Action = [
+      "secretsmanager:GetSecretValue"
+    ]
+    Resource = "arn:aws:secretsmanager:region:account:secret:prefix/*"
+  }]
+})
+```
+
+### SageMaker Invoke
+```hcl
+policy = jsonencode({
+  Version = "2012-10-17"
+  Statement = [{
+    Effect = "Allow"
+    Action = [
+      "sagemaker:InvokeEndpoint"
+    ]
+    Resource = "arn:aws:sagemaker:region:account:endpoint/endpoint-name"
+  }]
+})
+```
+
+### SQS Producer
+```hcl
+policy = jsonencode({
+  Version = "2012-10-17"
+  Statement = [{
+    Effect = "Allow"
+    Action = [
+      "sqs:SendMessage",
+      "sqs:GetQueueUrl"
+    ]
+    Resource = "arn:aws:sqs:region:account:queue-name"
+  }]
+})
+```
+
+## Step-by-Step Implementation
+
+### Step 1: Create IRSA Module
+
+File: `terraform/modules/irsa/main.tf`
+
+```hcl
+variable "project_name" {}
+variable "environment" {}
+variable "oidc_provider_arn" {}
+variable "oidc_issuer" {}
+variable "role_name" {}
+variable "namespace" {}
+variable "service_account" {}
+variable "policy_json" {}
+
+resource "aws_iam_role" "main" {
+  name = "${var.project_name}-${var.environment}-${var.role_name}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = var.oidc_provider_arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${var.oidc_issuer}:sub" = "system:serviceaccount:${var.namespace}:${var.service_account}"
+          "${var.oidc_issuer}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "main" {
+  name   = "policy"
+  role   = aws_iam_role.main.id
+  policy = var.policy_json
+}
+
+output "role_arn" {
+  value = aws_iam_role.main.arn
+}
+```
+
+### Step 2: Create Platform Roles
+
+File: `terraform/environments/dev/irsa.tf`
+
+```hcl
+module "external_secrets_irsa" {
+  source = "../../modules/irsa"
+
+  project_name      = var.project_name
+  environment       = var.environment
+  oidc_provider_arn = module.eks.oidc_provider_arn
+  oidc_issuer       = module.eks.oidc_issuer
+  role_name         = "external-secrets"
+  namespace         = "external-secrets"
+  service_account   = "external-secrets"
+
+  policy_json = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+      Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${var.environment}/*"
+    }]
+  })
+}
+
+module "cloudwatch_irsa" {
+  source = "../../modules/irsa"
+  # ... similar configuration
+}
+
+module "fluent_bit_irsa" {
+  source = "../../modules/irsa"
+  # ... similar configuration
+}
+```
+
+### Step 3: Create Outputs
+
+File: `terraform/modules/irsa/outputs.tf`
+
+```hcl
+output "external_secrets_role_arn" {
+  description = "IAM role ARN for External Secrets Operator"
+  value       = module.external_secrets_irsa.role_arn
+}
+
+output "cloudwatch_agent_role_arn" {
+  description = "IAM role ARN for CloudWatch agent"
+  value       = module.cloudwatch_irsa.role_arn
+}
+
+output "fluent_bit_role_arn" {
+  description = "IAM role ARN for Fluent Bit"
+  value       = module.fluent_bit_irsa.role_arn
+}
+```
+
+## Testing and Validation
+
+### Terraform Validation
+```bash
+terraform fmt -check
+terraform validate
+```
+
+### Role Trust Policy Verification
+```bash
+# Check trust policy
+aws iam get-role --role-name ROLE_NAME --query 'Role.AssumeRolePolicyDocument'
+```
+
+### Test IRSA from Pod
+```bash
+# Create test pod with service account
+kubectl run irsa-test \
+  --rm -it \
+  --image=amazon/aws-cli \
+  --overrides='{
+    "spec": {
+      "serviceAccountName": "external-secrets"
+    }
+  }' \
+  -- sts get-caller-identity
+
+# Expected output:
+# {
+#   "UserId": "AROAXXXXXXXXXX:botocore-session-xxx",
+#   "Account": "123456789012",
+#   "Arn": "arn:aws:sts::123456789012:assumed-role/external-secrets/botocore-session-xxx"
+# }
+```
+
+### Verify Token Projection
+```bash
+# Check projected token exists
+kubectl exec -it POD_NAME -- ls -la /var/run/secrets/eks.amazonaws.com/serviceaccount/
+
+# Decode token (JWT)
+kubectl exec -it POD_NAME -- cat /var/run/secrets/eks.amazonaws.com/serviceaccount/token | \
+  cut -d. -f2 | base64 -d | jq
+```
+
+## Troubleshooting
+
+### AssumeRoleWithWebIdentity Failed
+
+**Error**: `AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity`
+
+**Check**:
+```bash
+# Verify OIDC provider exists
+aws iam list-open-id-connect-providers
+
+# Check role trust policy
+aws iam get-role --role-name ROLE --query 'Role.AssumeRolePolicyDocument'
+
+# Verify service account annotation
+kubectl get sa SERVICE_ACCOUNT -n NAMESPACE -o yaml
+```
+
+**Common Issues**:
+1. OIDC issuer URL mismatch (http vs https, trailing slash)
+2. Namespace or service account name typo
+3. Service account missing annotation
+
+### Token Not Projected
+
+**Symptoms**: `/var/run/secrets/eks.amazonaws.com/` doesn't exist
+
+**Check**:
+```bash
+# Verify webhook is running
+kubectl get pods -n kube-system -l app=pod-identity-webhook
+```
+
+**Solutions**:
+- EKS should automatically project tokens
+- Ensure pod uses a service account with IRSA annotation
+- Restart pod after adding annotation
+
+### Permission Denied for AWS Service
+
+**Error**: `AccessDeniedException` when calling AWS API
+
+**Check**:
+```bash
+# Verify which role is being assumed
+kubectl exec -it POD -- aws sts get-caller-identity
+
+# Check CloudTrail for denied calls
+aws cloudtrail lookup-events --lookup-attributes AttributeKey=Username,AttributeValue=ROLE_NAME
+```
+
+**Solutions**:
+- Add required permissions to role policy
+- Check resource ARNs in policy match actual resources
+- Verify condition keys if using
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| IAM Roles | Free | No charge for IAM |
+| STS API Calls | Free | No charge |
+| **Total** | $0/month | IRSA has no direct cost |
+
+Indirect costs come from the AWS services the roles access.
+
+## Security Considerations
+
+1. **Least Privilege**: Each role should have minimal required permissions
+2. **Namespace Isolation**: Trust policies scoped to specific namespace:sa
+3. **No Wildcards**: Avoid `*` in resource ARNs where possible
+4. **Audit Trail**: All AssumeRole calls logged in CloudTrail
+5. **Token Rotation**: Tokens automatically rotate (audience-bound)
+
+## Files to Create
+
+```
+terraform/modules/irsa/
+├── main.tf           # IRSA role creation pattern
+├── variables.tf      # Input variables
+├── outputs.tf        # Output values
+└── README.md         # Module documentation
+
+terraform/environments/dev/
+├── irsa.tf           # Platform role definitions
+└── irsa_outputs.tf   # Role ARN outputs for GitOps
+```
+
+## Dependencies
+
+- **Depends on**: Module 2 (EKS Cluster - OIDC provider)
+- **Required by**: Module 6 (FluxCD), Module 7 (Core Platform)
+
+## Next Module
+
+After completing this module, proceed to:
+**Module 6: FluxCD Bootstrap** - Installs FluxCD and configures GitOps.

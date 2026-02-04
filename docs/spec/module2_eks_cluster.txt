@@ -1,0 +1,494 @@
+================================================================================
+MODULE 2: EKS CLUSTER SPECIFICATION
+================================================================================
+
+## Overview
+
+This module creates the EKS control plane, OIDC provider for IRSA, and base
+cluster configuration. The control plane is AWS-managed and runs in AWS's
+account, while we configure access and authentication.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           AWS Managed (EKS Service)                         │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                         EKS Control Plane                              │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │  │
+│  │  │ API Server  │  │    etcd     │  │ Controller  │  │  Scheduler  │  │  │
+│  │  │             │  │  (3 nodes)  │  │   Manager   │  │             │  │  │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘  │  │
+│  │                                                                        │  │
+│  │  Endpoint: https://XXXXX.gr7.ca-central-1.eks.amazonaws.com           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      │ Cross-account ENIs
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Your VPC (10.0.0.0/16)                           │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                        Private Subnets                               │  │
+│  │  ┌─────────────────────────┐    ┌─────────────────────────┐        │  │
+│  │  │   EKS-managed ENIs      │    │   EKS-managed ENIs      │        │  │
+│  │  │   (API server access)   │    │   (API server access)   │        │  │
+│  │  │   10.0.10.x             │    │   10.0.11.x             │        │  │
+│  │  └─────────────────────────┘    └─────────────────────────┘        │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      │ OIDC Federation
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              AWS IAM                                         │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  OIDC Provider: oidc.eks.ca-central-1.amazonaws.com/id/XXXXX         │  │
+│  │                                                                        │  │
+│  │  Enables: Service Account → IAM Role mapping (IRSA)                   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **EKS Architecture**
+   - Control plane vs data plane separation
+   - Cross-account ENI networking
+   - API server endpoint modes
+
+2. **OIDC and IRSA**
+   - How Kubernetes service accounts map to IAM roles
+   - OIDC provider trust relationships
+   - Token projection and STS assume role
+
+3. **Cluster Access**
+   - aws-auth ConfigMap for user/role mapping
+   - Public vs private endpoint access
+   - Security group requirements
+
+4. **Add-ons**
+   - VPC CNI (networking)
+   - CoreDNS (cluster DNS)
+   - kube-proxy (service routing)
+
+## Component Deep Dive
+
+### 1. EKS Cluster
+
+**Purpose**: Managed Kubernetes control plane
+
+**Configuration**:
+```hcl
+resource "aws_eks_cluster" "main" {
+  name     = "${var.project_name}-${var.environment}"
+  version  = "1.31"
+  role_arn = aws_iam_role.eks_cluster.arn
+
+  vpc_config {
+    # Deploy control plane ENIs in private subnets
+    subnet_ids = var.private_subnet_ids
+
+    # Endpoint access configuration
+    endpoint_private_access = true   # Enable private API access
+    endpoint_public_access  = true   # Enable public API access (with restrictions)
+    public_access_cidrs    = var.public_access_cidrs  # Restrict public access
+
+    # Security group for cluster communication
+    security_group_ids = [aws_security_group.eks_cluster.id]
+  }
+
+  # Enable control plane logging
+  enabled_cluster_log_types = [
+    "api",
+    "audit",
+    "authenticator"
+  ]
+
+  # Encryption for secrets
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks.arn
+    }
+    resources = ["secrets"]
+  }
+
+  # Ensure IAM role is created first
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster_policy
+  ]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks"
+  }
+}
+```
+
+**Key Settings Explained**:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `version` | 1.31 | Latest EKS version per requirements |
+| `endpoint_private_access` | true | Nodes can reach API via VPC |
+| `endpoint_public_access` | true | kubectl from developer machines |
+| `public_access_cidrs` | restricted | Limit public API access |
+| `encryption_config` | KMS | Encrypt secrets at rest |
+
+### 2. Cluster IAM Role
+
+**Purpose**: Allows EKS service to manage resources
+
+```hcl
+resource "aws_iam_role" "eks_cluster" {
+  name = "${var.project_name}-${var.environment}-eks-cluster"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "eks.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.eks_cluster.name
+}
+```
+
+### 3. OIDC Provider for IRSA
+
+**Purpose**: Enables pod-level IAM role assumption
+
+```hcl
+# Get OIDC provider thumbprint
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+
+  client_id_list = ["sts.amazonaws.com"]
+
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-oidc"
+  }
+}
+```
+
+**How IRSA Works**:
+1. ServiceAccount created with `eks.amazonaws.com/role-arn` annotation
+2. Pod gets projected service account token (JWT)
+3. AWS SDK calls `sts:AssumeRoleWithWebIdentity` with JWT
+4. STS validates JWT against OIDC provider
+5. STS returns temporary credentials
+6. Pod uses credentials to call AWS APIs
+
+### 4. KMS Key for Secret Encryption
+
+**Purpose**: Encrypt Kubernetes secrets at rest
+
+```hcl
+resource "aws_kms_key" "eks" {
+  description             = "KMS key for EKS secret encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-kms"
+  }
+}
+
+resource "aws_kms_alias" "eks" {
+  name          = "alias/${var.project_name}-${var.environment}-eks"
+  target_key_id = aws_kms_key.eks.key_id
+}
+```
+
+### 5. Cluster Security Group
+
+**Purpose**: Control traffic to/from control plane
+
+```hcl
+resource "aws_security_group" "eks_cluster" {
+  name        = "${var.project_name}-${var.environment}-eks-cluster"
+  description = "Security group for EKS cluster control plane"
+  vpc_id      = var.vpc_id
+
+  # Egress to nodes
+  egress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.eks_nodes.id]
+    description     = "HTTPS to nodes"
+  }
+
+  egress {
+    from_port       = 10250
+    to_port         = 10250
+    protocol        = "tcp"
+    security_groups = [aws_security_group.eks_nodes.id]
+    description     = "Kubelet API"
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-cluster-sg"
+  }
+}
+```
+
+### 6. EKS Add-ons
+
+**VPC CNI** (networking):
+```hcl
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "vpc-cni"
+
+  # Use latest compatible version
+  addon_version = data.aws_eks_addon_version.vpc_cni.version
+
+  # Preserve settings on destroy
+  preserve = true
+
+  configuration_values = jsonencode({
+    enableNetworkPolicy = "true"
+  })
+}
+
+data "aws_eks_addon_version" "vpc_cni" {
+  addon_name         = "vpc-cni"
+  kubernetes_version = aws_eks_cluster.main.version
+  most_recent        = true
+}
+```
+
+**CoreDNS** (cluster DNS):
+```hcl
+resource "aws_eks_addon" "coredns" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "coredns"
+  addon_version = data.aws_eks_addon_version.coredns.version
+
+  depends_on = [aws_eks_node_group.main]  # Needs nodes first
+}
+```
+
+**kube-proxy** (service routing):
+```hcl
+resource "aws_eks_addon" "kube_proxy" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "kube-proxy"
+  addon_version = data.aws_eks_addon_version.kube_proxy.version
+}
+```
+
+## Step-by-Step Implementation
+
+### Step 1: Create IAM Resources
+
+File: `terraform/modules/eks/iam.tf`
+- Cluster IAM role
+- OIDC provider
+- KMS key for encryption
+
+### Step 2: Create Security Groups
+
+File: `terraform/modules/eks/security_groups.tf`
+- Cluster security group
+- Node security group (created here, used in Module 3)
+
+### Step 3: Create EKS Cluster
+
+File: `terraform/modules/eks/main.tf`
+- EKS cluster resource
+- Cluster configuration
+
+### Step 4: Create Add-ons
+
+File: `terraform/modules/eks/addons.tf`
+- VPC CNI addon
+- CoreDNS addon
+- kube-proxy addon
+
+### Step 5: Create Outputs
+
+File: `terraform/modules/eks/outputs.tf`
+```hcl
+output "cluster_name" {
+  description = "EKS cluster name"
+  value       = aws_eks_cluster.main.name
+}
+
+output "cluster_endpoint" {
+  description = "EKS cluster API endpoint"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "cluster_certificate_authority" {
+  description = "Cluster CA certificate (base64)"
+  value       = aws_eks_cluster.main.certificate_authority[0].data
+}
+
+output "cluster_security_group_id" {
+  description = "Cluster security group ID"
+  value       = aws_security_group.eks_cluster.id
+}
+
+output "node_security_group_id" {
+  description = "Node security group ID"
+  value       = aws_security_group.eks_nodes.id
+}
+
+output "oidc_provider_arn" {
+  description = "OIDC provider ARN for IRSA"
+  value       = aws_iam_openid_connect_provider.eks.arn
+}
+
+output "oidc_provider_url" {
+  description = "OIDC provider URL"
+  value       = aws_iam_openid_connect_provider.eks.url
+}
+```
+
+## Testing and Validation
+
+### Terraform Validation
+```bash
+cd terraform/modules/eks
+terraform fmt -check
+terraform validate
+```
+
+### Cluster Verification
+```bash
+# Update kubeconfig
+aws eks update-kubeconfig --region ca-central-1 --name CLUSTER_NAME
+
+# Verify cluster connection
+kubectl cluster-info
+
+# Check cluster version
+kubectl version
+
+# Verify OIDC provider
+aws iam list-open-id-connect-providers
+```
+
+### Add-on Verification
+```bash
+# Check add-on status
+aws eks describe-addon --cluster-name CLUSTER --addon-name vpc-cni
+aws eks describe-addon --cluster-name CLUSTER --addon-name coredns
+aws eks describe-addon --cluster-name CLUSTER --addon-name kube-proxy
+
+# Check system pods (after nodes are ready)
+kubectl get pods -n kube-system
+```
+
+## Troubleshooting
+
+### Cluster Creation Fails
+
+**Error**: `Cluster creation failed`
+
+**Check**:
+```bash
+# Check CloudWatch logs
+aws logs tail /aws/eks/CLUSTER/cluster --follow
+
+# Check IAM role
+aws iam get-role --role-name eks-cluster-role
+```
+
+**Solutions**:
+- Ensure cluster IAM role has AmazonEKSClusterPolicy attached
+- Ensure subnets have correct tags
+- Ensure VPC has DNS hostnames enabled
+
+### OIDC Provider Issues
+
+**Error**: `Unable to validate OIDC issuer`
+
+**Check**:
+```bash
+# Verify OIDC URL
+aws eks describe-cluster --name CLUSTER --query cluster.identity.oidc
+
+# Test OIDC endpoint
+curl -s https://oidc.eks.ca-central-1.amazonaws.com/id/XXXXX/.well-known/openid-configuration
+```
+
+**Solutions**:
+- Ensure OIDC provider URL matches cluster issuer exactly
+- Verify thumbprint is correct
+
+### API Server Unreachable
+
+**Symptoms**: kubectl timeout
+
+**Check**:
+```bash
+# Test endpoint directly
+curl -k https://ENDPOINT/healthz
+
+# Check endpoint access
+aws eks describe-cluster --name CLUSTER --query cluster.resourcesVpcConfig
+```
+
+**Solutions**:
+- If public access, check `public_access_cidrs`
+- If private access, ensure network path exists
+- Check cluster security group allows traffic
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| EKS Control Plane | $73.00 | Fixed per cluster |
+| CloudWatch Logs | ~$5.00 | Control plane logs |
+| KMS Key | $1.00 | Per key/month |
+| **Total** | ~$79/month | Control plane only |
+
+## Security Considerations
+
+1. **Secrets Encryption**: KMS encryption for secrets at rest
+2. **API Access**: Public access restricted by CIDR
+3. **Audit Logging**: API and audit logs to CloudWatch
+4. **OIDC**: Secure token-based authentication for pods
+5. **Security Groups**: Least privilege for control plane
+
+## Files to Create
+
+```
+terraform/modules/eks/
+├── main.tf           # EKS cluster resource
+├── iam.tf            # Cluster IAM role, OIDC provider, KMS
+├── security_groups.tf # Cluster and node security groups
+├── addons.tf         # VPC CNI, CoreDNS, kube-proxy
+├── variables.tf      # Input variables
+├── outputs.tf        # Output values
+└── README.md         # Module documentation
+```
+
+## Dependencies
+
+- **Depends on**: Module 1 (VPC & Networking)
+- **Required by**: Module 3 (Node Groups), Module 5 (IAM & IRSA), Module 6 (FluxCD)
+
+## Next Module
+
+After completing this module, proceed to:
+**Module 3: Node Groups** - Creates the managed node groups that run
+workloads in the cluster.

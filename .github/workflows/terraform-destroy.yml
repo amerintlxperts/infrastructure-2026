@@ -1,0 +1,164 @@
+# =============================================================================
+# Terraform Destroy Pipeline
+# =============================================================================
+# Manually triggered workflow to destroy all Terraform infrastructure.
+# Requires explicit confirmation to prevent accidental destruction.
+#
+# WARNING: This will permanently delete all resources!
+# =============================================================================
+
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.5'
+
+jobs:
+  validate:
+    name: Validate Confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        if: inputs.confirm != 'destroy'
+        run: |
+          echo "::error::Confirmation failed. You must type 'destroy' to confirm."
+          exit 1
+
+      - name: Production warning
+        if: inputs.environment == 'prod'
+        run: |
+          echo "::warning::You are about to destroy PRODUCTION infrastructure!"
+          echo "::warning::This action is irreversible and will cause downtime!"
+
+  destroy:
+    name: Terraform Destroy
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}  # Requires environment approval if configured
+    env:
+      # Pass admin CIDR to Terraform for security group rules
+      TF_VAR_admin_cidr: ${{ secrets.TF_VAR_admin_cidr }}
+      # Pass admin role ARN for EKS kubectl access
+      TF_VAR_admin_role_arn: ${{ secrets.TF_VAR_admin_role_arn }}
+      # Pass additional cluster admin ARNs (JSON array)
+      TF_VAR_additional_cluster_admins: ${{ secrets.TF_VAR_additional_cluster_admins }}
+      # Pass FortiFlex token for FortiWeb licensing (optional)
+      TF_VAR_fortiflex_token: ${{ secrets.TF_VAR_fortiflex_token }}
+      # DNS configuration
+      TF_VAR_domain_name: ${{ secrets.TF_VAR_domain_name }}
+      TF_VAR_acme_email: ${{ secrets.TF_VAR_acme_email }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      # -------------------------------------------------------------------------
+      # Grant GitHub Runner Access to EKS API
+      # -------------------------------------------------------------------------
+      # The EKS API is restricted to the admin CIDR (user's IP from hydration).
+      # For destroy to work, we need to temporarily add the runner's IP.
+      # This is safe because we're destroying the cluster anyway.
+      # -------------------------------------------------------------------------
+      - name: Add GitHub Runner IP to EKS API Access
+        id: eks-access
+        run: |
+          CLUSTER_NAME="xperts-${{ inputs.environment }}"
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com | tr -d '\n')
+          RUNNER_CIDR="${RUNNER_IP}/32"
+
+          echo "Runner IP: ${RUNNER_IP}"
+          echo "Cluster: ${CLUSTER_NAME}"
+
+          # Check if cluster exists
+          if ! aws eks describe-cluster --name "${CLUSTER_NAME}" --query 'cluster.name' --output text 2>/dev/null; then
+            echo "Cluster ${CLUSTER_NAME} does not exist or is already deleted. Skipping."
+            echo "cluster_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "cluster_exists=true" >> $GITHUB_OUTPUT
+
+          # Get current public access CIDRs
+          CURRENT_CIDRS=$(aws eks describe-cluster --name "${CLUSTER_NAME}" \
+            --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json)
+
+          echo "Current CIDRs: ${CURRENT_CIDRS}"
+
+          # Check if runner IP is already allowed
+          if echo "${CURRENT_CIDRS}" | grep -q "${RUNNER_CIDR}"; then
+            echo "Runner IP already in allowed CIDRs. Skipping update."
+            exit 0
+          fi
+
+          # Add runner CIDR to the list
+          NEW_CIDRS=$(echo "${CURRENT_CIDRS}" | jq --arg cidr "${RUNNER_CIDR}" '. + [$cidr]')
+
+          echo "Updating EKS public access CIDRs to include runner IP..."
+          aws eks update-cluster-config \
+            --name "${CLUSTER_NAME}" \
+            --resources-vpc-config "publicAccessCidrs=${NEW_CIDRS}"
+
+          # Wait for the update to complete
+          echo "Waiting for cluster update to complete..."
+          aws eks wait cluster-active --name "${CLUSTER_NAME}"
+          echo "Cluster updated successfully."
+
+      - name: Terraform Destroy Plan
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: terraform plan -destroy -out=destroy.tfplan
+
+      - name: Terraform Destroy
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: terraform apply -destroy -auto-approve destroy.tfplan
+
+      - name: Cleanup Summary
+        run: |
+          echo "## Destroy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Environment: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All Terraform-managed resources have been destroyed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** Bootstrap resources (S3 bucket, DynamoDB table, IAM role) are NOT deleted." >> $GITHUB_STEP_SUMMARY
+          echo "To remove those, run: \`./bootstrap/cleanup.sh --skip-terraform\`" >> $GITHUB_STEP_SUMMARY

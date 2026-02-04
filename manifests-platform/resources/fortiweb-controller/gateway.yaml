@@ -1,0 +1,222 @@
+# =============================================================================
+# FortiWebIngress Gateway
+# =============================================================================
+# Central ingress gateway for all applications. The controller reads FortiWeb
+# network config (IPs, ports) from the fortiweb-config secret, which is synced
+# from AWS Secrets Manager via External Secrets.
+#
+# Dynamic values loaded from fortiweb-config secret:
+#   - fortiweb.address: Built from FORTIWEB_IP:FORTIWEB_PORT
+#   - dns.target: From FORTIWEB_PUBLIC_IP (EIP)
+#   - virtualServer.ip: From FORTIWEB_PORT1_IP
+# =============================================================================
+apiVersion: fortiwebingress.io/v1
+kind: FortiWebIngress
+metadata:
+  name: gateway
+  namespace: fortiweb-controller
+spec:
+  # FortiWeb connection - address read from fortiweb-config secret
+  fortiweb:
+    # address: (loaded from secret - FORTIWEB_IP:FORTIWEB_PORT)
+    credentialsSecret: fortiweb-credentials
+    credentialsSecretNamespace: fortiweb-controller
+
+  # Virtual server configuration
+  virtualServer:
+    name: gateway
+    # ip: (loaded from secret - FORTIWEB_PORT1_IP)
+    interface: port1
+    useInterfaceIP: true
+
+  # WAF policy settings
+  policy:
+    name: gateway-policy
+    webProtectionProfile: "Inline Standard Protection"
+
+  # DNS configuration - target IP read from fortiweb-config secret
+  dns:
+    enabled: true
+    # target: (loaded from secret - FORTIWEB_PUBLIC_IP)
+
+  # Application routes with TLS
+  routes:
+    # =========================================================================
+    # Canada region - region-specific content apps and landing page
+    # =========================================================================
+    - host: canada.amerintlxperts.com
+      path: /secops
+      default: false
+      backend:
+        serviceName: secops-canada
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: canada-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: canada.amerintlxperts.com
+      path: /ai
+      default: false
+      backend:
+        serviceName: ai-canada
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: canada-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: canada.amerintlxperts.com
+      path: /enterprise-protection
+      default: false
+      backend:
+        serviceName: enterprise-protection-canada
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: canada-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: canada.amerintlxperts.com
+      path: /
+      default: false
+      backend:
+        serviceName: landing-page-canada
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: canada-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+
+    # =========================================================================
+    # LATAM region - region-specific content apps and landing page
+    # =========================================================================
+    - host: latam.amerintlxperts.com
+      path: /secops
+      default: false
+      backend:
+        serviceName: secops-latam
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: latam-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: latam.amerintlxperts.com
+      path: /ai
+      default: false
+      backend:
+        serviceName: ai-latam
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: latam-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: latam.amerintlxperts.com
+      path: /enterprise-protection
+      default: false
+      backend:
+        serviceName: enterprise-protection-latam
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: latam-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: latam.amerintlxperts.com
+      path: /
+      default: false
+      backend:
+        serviceName: landing-page-latam
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: latam-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+
+    # =========================================================================
+    # Xperts (default) region
+    # =========================================================================
+    - host: xperts.amerintlxperts.com
+      path: /secops
+      default: false
+      backend:
+        serviceName: secops
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: xperts-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: xperts.amerintlxperts.com
+      path: /ai
+      default: false
+      backend:
+        serviceName: ai
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: xperts-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: xperts.amerintlxperts.com
+      path: /enterprise-protection
+      default: false
+      backend:
+        serviceName: enterprise-protection
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: xperts-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
+    - host: xperts.amerintlxperts.com
+      path: /
+      default: false
+      backend:
+        serviceName: landing-page
+        serviceNamespace: xperts
+        port: 80
+      tls:
+        enabled: true
+        secretName: xperts-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200

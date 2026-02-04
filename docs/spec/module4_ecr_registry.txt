@@ -1,0 +1,533 @@
+================================================================================
+MODULE 4: ECR & REGISTRY SPECIFICATION
+================================================================================
+
+## Overview
+
+This module configures Amazon ECR with pull-through cache rules to proxy
+images from GitHub Container Registry (GHCR). This provides faster image pulls,
+resilience against GHCR outages, and native AWS authentication.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Image Pull Flow                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                         EKS Cluster                                  │  │
+│  │                                                                       │  │
+│  │  Pod Manifest:                                                        │  │
+│  │  image: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/             │  │
+│  │         ghcr/amerintlxperts/my-app:v1.0.0                                    │  │
+│  │                                      │                                │  │
+│  │                                      │ Pull request                   │  │
+│  │                                      ▼                                │  │
+│  └──────────────────────────────────────┼────────────────────────────────┘  │
+│                                         │                                   │
+│                                         │                                   │
+│  ┌──────────────────────────────────────▼────────────────────────────────┐  │
+│  │                          Amazon ECR                                   │  │
+│  │                                                                       │  │
+│  │  Pull-through Cache Rule:                                            │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │  Prefix: ghcr/*                                              │    │  │
+│  │  │  Upstream: ghcr.io                                           │    │  │
+│  │  │  Credential: Secrets Manager (ghcr-token)                    │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                                      │                                │  │
+│  │                                      │ Cache miss?                    │  │
+│  │                                      ▼                                │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │                    Cache Decision                            │    │  │
+│  │  │                                                              │    │  │
+│  │  │   Cache HIT ──────────► Return cached layers                │    │  │
+│  │  │                         (fast, ~100ms)                       │    │  │
+│  │  │                                                              │    │  │
+│  │  │   Cache MISS ─────────► Fetch from upstream                 │    │  │
+│  │  │                         (slower, ~5-30s)                     │    │  │
+│  │  │                         Cache for next time                  │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                                      │                                │  │
+│  └──────────────────────────────────────┼────────────────────────────────┘  │
+│                                         │                                   │
+│                                         │ Cache miss: fetch upstream        │
+│                                         ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                    GitHub Container Registry                         │  │
+│  │                         (ghcr.io)                                    │  │
+│  │                                                                       │  │
+│  │  amerintlxperts/my-app:v1.0.0                                                │  │
+│  │  amerintlxperts/another-app:latest                                           │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **ECR Pull-through Cache**
+   - How upstream registries are proxied
+   - Authentication configuration
+   - Cache behavior and TTL
+
+2. **GHCR Authentication**
+   - Personal access tokens vs GitHub App tokens
+   - Token scope requirements
+   - Secrets Manager integration
+
+3. **Image Reference Patterns**
+   - Converting GHCR references to ECR
+   - Kustomize image transformations
+   - Flux image policies
+
+4. **Cache Management**
+   - Lifecycle policies for cost control
+   - Immutable tags
+   - Vulnerability scanning
+
+## Component Deep Dive
+
+### 1. Pull-through Cache Rule
+
+**Purpose**: Proxy and cache GHCR images through ECR
+
+```hcl
+resource "aws_ecr_pull_through_cache_rule" "ghcr" {
+  ecr_repository_prefix = "ghcr"
+  upstream_registry_url = "ghcr.io"
+
+  # Credential for private GHCR repos
+  credential_arn = aws_secretsmanager_secret.ghcr_token.arn
+}
+```
+
+**How It Works**:
+1. Pod requests image: `ACCOUNT.dkr.ecr.REGION.amazonaws.com/ghcr/amerintlxperts/app:v1`
+2. ECR checks cache for `ghcr/amerintlxperts/app:v1`
+3. If cached: Return immediately from ECR
+4. If not cached:
+   - Authenticate to ghcr.io using credential
+   - Pull image from ghcr.io
+   - Cache in ECR
+   - Return to pod
+
+### 2. GHCR Authentication Secret
+
+**Purpose**: Authenticate to GHCR for private repositories
+
+```hcl
+resource "aws_secretsmanager_secret" "ghcr_token" {
+  name = "${var.project_name}-${var.environment}-ghcr-token"
+
+  # Force delete without recovery window (for dev)
+  recovery_window_in_days = 0
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-ghcr-token"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "ghcr_token" {
+  secret_id = aws_secretsmanager_secret.ghcr_token.id
+
+  # ECR expects specific JSON format
+  secret_string = jsonencode({
+    username = "amerintlxperts"  # GitHub org/user name
+    password = var.ghcr_token  # PAT with read:packages scope
+  })
+}
+```
+
+**Secret Format**:
+ECR pull-through cache expects:
+```json
+{
+  "username": "github-username-or-org",
+  "password": "ghp_xxxxxxxxxxxx"
+}
+```
+
+**Token Requirements**:
+- Scope: `read:packages`
+- Type: Personal Access Token (classic) or Fine-grained PAT
+
+### 3. ECR Repository Settings (Auto-created)
+
+Repositories are auto-created on first pull, but we can set defaults:
+
+```hcl
+# Registry-level settings
+resource "aws_ecr_registry_policy" "main" {
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowPullThrough"
+      Effect    = "Allow"
+      Principal = {
+        AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+      }
+      Action = [
+        "ecr:CreateRepository",
+        "ecr:BatchImportUpstreamImage"
+      ]
+      Resource  = "*"
+    }]
+  })
+}
+
+# Default lifecycle policy for cached images
+resource "aws_ecr_registry_scanning_configuration" "main" {
+  scan_type = "ENHANCED"
+
+  rule {
+    scan_frequency = "CONTINUOUS_SCAN"
+    repository_filter {
+      filter      = "*"
+      filter_type = "WILDCARD"
+    }
+  }
+}
+```
+
+### 4. Lifecycle Policy
+
+**Purpose**: Automatically clean up old cached images
+
+```hcl
+# Apply to all ghcr/* repositories
+resource "aws_ecr_lifecycle_policy" "ghcr_cache" {
+  # This is applied via registry replication or manually after repos exist
+  repository = "ghcr/amerintlxperts/my-app"  # Example - apply per repo
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Expire untagged images after 7 days"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 7
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep only 10 most recent tagged images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["v"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 10
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
+}
+```
+
+## Image Reference Transformation
+
+### Original GHCR Reference
+```yaml
+image: ghcr.io/amerintlxperts/my-app:v1.0.0
+```
+
+### ECR Pull-through Cache Reference
+```yaml
+image: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app:v1.0.0
+```
+
+### Kustomize Transformation
+
+```yaml
+# kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+images:
+  - name: ghcr.io/amerintlxperts/my-app
+    newName: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app
+```
+
+### Flux ImagePolicy (for automation)
+
+```yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImageRepository
+metadata:
+  name: my-app
+spec:
+  image: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app
+  interval: 1m
+  provider: aws
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImagePolicy
+metadata:
+  name: my-app
+spec:
+  imageRepositoryRef:
+    name: my-app
+  policy:
+    semver:
+      range: '>=1.0.0'
+```
+
+## Step-by-Step Implementation
+
+### Step 1: Create GHCR Token Secret
+
+File: `terraform/modules/ecr/secrets.tf`
+
+```hcl
+# Create secret (token value provided via variable)
+resource "aws_secretsmanager_secret" "ghcr_token" {
+  name                    = "${var.project_name}-${var.environment}-ghcr-token"
+  recovery_window_in_days = var.environment == "prod" ? 30 : 0
+}
+
+resource "aws_secretsmanager_secret_version" "ghcr_token" {
+  secret_id = aws_secretsmanager_secret.ghcr_token.id
+  secret_string = jsonencode({
+    username = var.github_org
+    password = var.ghcr_token
+  })
+}
+```
+
+### Step 2: Create Pull-through Cache Rule
+
+File: `terraform/modules/ecr/main.tf`
+
+```hcl
+resource "aws_ecr_pull_through_cache_rule" "ghcr" {
+  ecr_repository_prefix = "ghcr"
+  upstream_registry_url = "ghcr.io"
+  credential_arn        = aws_secretsmanager_secret.ghcr_token.arn
+}
+```
+
+### Step 3: Create Registry Configuration
+
+File: `terraform/modules/ecr/registry.tf`
+
+```hcl
+# Enable image scanning
+resource "aws_ecr_registry_scanning_configuration" "main" {
+  scan_type = "BASIC"  # or "ENHANCED" for Inspector integration
+
+  rule {
+    scan_frequency = "SCAN_ON_PUSH"
+    repository_filter {
+      filter      = "ghcr/*"
+      filter_type = "WILDCARD"
+    }
+  }
+}
+```
+
+### Step 4: Create Outputs
+
+File: `terraform/modules/ecr/outputs.tf`
+
+```hcl
+output "ecr_registry_url" {
+  description = "ECR registry URL"
+  value       = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"
+}
+
+output "ghcr_prefix" {
+  description = "Prefix for GHCR cached images"
+  value       = "ghcr"
+}
+
+output "ghcr_credential_secret_arn" {
+  description = "ARN of GHCR credential secret"
+  value       = aws_secretsmanager_secret.ghcr_token.arn
+}
+```
+
+## Testing and Validation
+
+### Terraform Validation
+```bash
+terraform fmt -check
+terraform validate
+```
+
+### Pull-through Cache Verification
+```bash
+# Check cache rule exists
+aws ecr describe-pull-through-cache-rules
+
+# Expected output:
+# {
+#   "pullThroughCacheRules": [{
+#     "ecrRepositoryPrefix": "ghcr",
+#     "upstreamRegistryUrl": "ghcr.io",
+#     "credentialArn": "arn:aws:secretsmanager:..."
+#   }]
+# }
+```
+
+### Test Image Pull
+```bash
+# Login to ECR
+aws ecr get-login-password --region ca-central-1 | \
+  docker login --username AWS --password-stdin \
+  123456789012.dkr.ecr.ca-central-1.amazonaws.com
+
+# Pull through cache (first pull creates cache)
+docker pull 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app:v1.0.0
+
+# Verify repository was created
+aws ecr describe-repositories --repository-names ghcr/amerintlxperts/my-app
+```
+
+### Kubernetes Pull Test
+```bash
+# Create test pod
+kubectl run test-pull --rm -it \
+  --image=123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app:v1.0.0 \
+  -- /bin/sh
+
+# Check pull succeeded
+kubectl describe pod test-pull | grep -i pull
+```
+
+## Troubleshooting
+
+### Authentication Failed
+
+**Symptoms**: `pull access denied` or `unauthorized`
+
+**Check**:
+```bash
+# Verify secret exists and has correct format
+aws secretsmanager get-secret-value --secret-id ghcr-token --query SecretString
+
+# Test GHCR authentication directly
+echo $GHCR_TOKEN | docker login ghcr.io -u amerintlxperts --password-stdin
+```
+
+**Solutions**:
+- Verify token has `read:packages` scope
+- Check username matches GitHub org/user
+- Ensure secret is in correct JSON format
+
+### Cache Miss on Every Pull
+
+**Symptoms**: Slow pulls every time
+
+**Check**:
+```bash
+# Verify cache rule is active
+aws ecr describe-pull-through-cache-rules
+
+# Check if repository exists
+aws ecr describe-repositories --repository-names ghcr/amerintlxperts/my-app
+```
+
+**Solutions**:
+- First pull always misses cache (expected)
+- Verify lifecycle policy isn't expiring images too quickly
+- Check ECR repository exists after first pull
+
+### Repository Auto-creation Failed
+
+**Symptoms**: `RepositoryNotFoundException`
+
+**Check**:
+```bash
+# List repositories
+aws ecr describe-repositories
+
+# Check registry policy
+aws ecr get-registry-policy
+```
+
+**Solutions**:
+- Ensure ECR has permissions to create repositories
+- Verify pull-through cache rule prefix matches request
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| ECR Storage | $0.10/GB | Cached images |
+| Data Transfer | $0.09/GB | First pull from GHCR |
+| ECR to EC2 (same region) | Free | Subsequent pulls |
+| **Estimate** | ~$5/month | 50GB cached images |
+
+### Cost Optimization
+
+1. **Lifecycle Policies**: Expire old images automatically
+2. **Scan on Push**: Only scan images when cached, not continuously
+3. **Right-size Cache**: Don't cache unused images
+
+## Security Considerations
+
+1. **Credential Security**: GHCR token in Secrets Manager, not Git
+2. **Image Scanning**: Enable vulnerability scanning for cached images
+3. **IAM Permissions**: Nodes only have ECR read access
+4. **Immutable Tags**: Consider for production images
+5. **Audit Trail**: ECR API calls logged in CloudTrail
+
+## Files to Create
+
+```
+terraform/modules/ecr/
+├── main.tf           # Pull-through cache rule
+├── secrets.tf        # GHCR credential secret
+├── registry.tf       # Registry configuration, scanning
+├── variables.tf      # Input variables
+├── outputs.tf        # Output values
+└── README.md         # Module documentation
+```
+
+## Dependencies
+
+- **Depends on**: Module 1 (VPC for endpoints)
+- **Required by**: Module 7 (Core Platform - image pulls)
+
+## GHCR Token Setup Instructions
+
+### Creating a GitHub Personal Access Token
+
+1. Go to GitHub → Settings → Developer settings → Personal access tokens
+2. Generate new token (classic)
+3. Select scope: `read:packages`
+4. Copy token value
+5. Store securely (you won't see it again)
+
+### Providing Token to Terraform
+
+Option 1: Environment variable
+```bash
+export TF_VAR_ghcr_token="ghp_xxxxxxxxxxxx"
+terraform apply
+```
+
+Option 2: Terraform Cloud variable (recommended for teams)
+- Add `ghcr_token` as sensitive variable in Terraform Cloud
+
+Option 3: AWS Secrets Manager (pre-create)
+```bash
+aws secretsmanager create-secret \
+  --name ghcr-token \
+  --secret-string '{"username":"amerintlxperts","password":"ghp_xxx"}'
+```
+
+## Next Module
+
+After completing this module, proceed to:
+**Module 5: IAM & IRSA** - Creates IAM roles that pods can assume via IRSA.

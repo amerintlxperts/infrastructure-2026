@@ -1,0 +1,218 @@
+# =============================================================================
+# FortiWeb Password Bootstrap Job
+# =============================================================================
+# Changes the FortiWeb admin password from the default (instance-id) to the
+# password stored in AWS Secrets Manager, then restarts the Ingress Controller.
+#
+# PREREQUISITES:
+# - fortiweb-config secret (from ExternalSecret) with FORTIWEB_IP, instance_id
+# - fortiweb-credentials secret (from ExternalSecret) with password
+#
+# AUTHENTICATION:
+# FortiWeb API uses BASE64-encoded JSON tokens in the Authorization header:
+#   {"username":"admin","password":"...","vdom":"root"}
+# This is stateless - no login/token exchange required.
+#
+# RETRY LOGIC:
+# - Waits up to 5 minutes for FortiWeb API to be accessible
+# - 30s delay after API accessible for full initialization
+# - Tries new password first (idempotency check)
+# - Up to 5 password change attempts with 10s between retries
+# - Verifies new password works after change
+# - Restarts IC deployment to pick up new credentials
+# - K8s backoffLimit: 5 for pod-level retries
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fortiweb-bootstrap
+  namespace: fortiweb-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fortiweb-bootstrap
+  namespace: fortiweb-controller
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fortiweb-bootstrap
+  namespace: fortiweb-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fortiweb-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: fortiweb-bootstrap
+  namespace: fortiweb-controller
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fortiweb-password-bootstrap
+  namespace: fortiweb-controller
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 5
+  template:
+    spec:
+      serviceAccountName: fortiweb-bootstrap
+      restartPolicy: OnFailure
+      containers:
+      - name: bootstrap
+        image: bitnami/kubectl:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          #!/bin/bash
+          set -e
+
+          # Configuration
+          MAX_WAIT_SECONDS=300
+          WAIT_INTERVAL=10
+          MAX_RETRIES=5
+          IC_DEPLOYMENT="fortiweb-controller"
+
+          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+
+          # Function: Generate BASE64 auth token for FortiWeb API
+          # FortiWeb uses JSON-based auth: {"username":"admin","password":"...","vdom":"root"}
+          make_auth_token() {
+            local password="$1"
+            printf '{"username":"admin","password":"%s","vdom":"root"}' "$password" | base64 | tr -d '\n'
+          }
+
+          # Function: Wait for FortiWeb API to be accessible
+          wait_for_fortiweb() {
+            log "Waiting for FortiWeb API at ${FORTIWEB_IP}:8443..."
+            elapsed=0
+            while [ $elapsed -lt $MAX_WAIT_SECONDS ]; do
+              if curl -sk --connect-timeout 5 "https://${FORTIWEB_IP}:8443" >/dev/null 2>&1; then
+                log "FortiWeb API is accessible"
+                return 0
+              fi
+              log "Not ready yet, waiting ${WAIT_INTERVAL}s... (${elapsed}/${MAX_WAIT_SECONDS}s)"
+              sleep $WAIT_INTERVAL
+              elapsed=$((elapsed + WAIT_INTERVAL))
+            done
+            log "ERROR: Timeout waiting for FortiWeb"
+            return 1
+          }
+
+          # Function: Test API authentication with given password
+          test_auth() {
+            local password="$1"
+            local token=$(make_auth_token "$password")
+            curl -sk "https://${FORTIWEB_IP}:8443/api/v2.0/cmdb/system/admin?mkey=admin" \
+              -H "Authorization: $token" 2>/dev/null
+          }
+
+          # Function: Change admin password and disable force-password-change
+          change_password() {
+            local current_pass="$1"
+            local new_pass="$2"
+            local token=$(make_auth_token "$current_pass")
+            curl -sk -X PUT "https://${FORTIWEB_IP}:8443/api/v2.0/cmdb/system/admin?mkey=admin" \
+              -H "Authorization: $token" \
+              -H "Content-Type: application/json" \
+              -d "{\"data\":{\"password\":\"${new_pass}\",\"force-password-change\":\"disable\"}}" 2>/dev/null
+          }
+
+          # Function: Restart the IC deployment
+          restart_ic() {
+            log "Restarting Ingress Controller deployment..."
+            kubectl rollout restart deployment/${IC_DEPLOYMENT} -n fortiweb-controller
+            log "IC restart triggered"
+          }
+
+          # Main logic with retry
+          main() {
+            wait_for_fortiweb || exit 1
+
+            # Give FortiWeb a moment to fully initialize after API is accessible
+            log "Waiting 30s for FortiWeb to fully initialize..."
+            sleep 30
+
+            # Check if password already changed (idempotent)
+            log "Checking if password is already configured..."
+            response=$(test_auth "${FORTIWEB_PASSWORD}")
+            if echo "$response" | grep -q '"results"'; then
+              log "SUCCESS: Password already set to target value."
+              log "Restarting IC to ensure it has correct credentials..."
+              restart_ic
+              exit 0
+            fi
+
+            # Try to change password with retries
+            for attempt in $(seq 1 $MAX_RETRIES); do
+              log "Attempt ${attempt}/${MAX_RETRIES}: Testing default credentials..."
+
+              # Verify we can authenticate with instance-id password
+              response=$(test_auth "${FORTIWEB_INSTANCE_ID}")
+              if ! echo "$response" | grep -q '"results"'; then
+                log "Authentication with instance-id failed. Response: $response"
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                  log "Retrying in ${WAIT_INTERVAL}s..."
+                  sleep $WAIT_INTERVAL
+                  continue
+                fi
+                log "ERROR: All authentication attempts failed"
+                exit 1
+              fi
+
+              log "Authentication successful. Changing password..."
+              result=$(change_password "${FORTIWEB_INSTANCE_ID}" "${FORTIWEB_PASSWORD}")
+
+              if echo "$result" | grep -q '"results"'; then
+                log "SUCCESS: Password changed successfully!"
+
+                # Verify the new password works
+                log "Verifying new credentials..."
+                sleep 5
+                verify=$(test_auth "${FORTIWEB_PASSWORD}")
+                if echo "$verify" | grep -q '"results"'; then
+                  log "VERIFIED: New password is working"
+                  restart_ic
+                  exit 0
+                else
+                  log "WARNING: Verification failed, but password change reported success"
+                  restart_ic
+                  exit 0
+                fi
+              else
+                log "Password change failed. Response: $result"
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                  log "Retrying in ${WAIT_INTERVAL}s..."
+                  sleep $WAIT_INTERVAL
+                fi
+              fi
+            done
+
+            log "ERROR: Failed to change password after ${MAX_RETRIES} attempts"
+            exit 1
+          }
+
+          main
+        env:
+        - name: FORTIWEB_IP
+          valueFrom:
+            secretKeyRef:
+              name: fortiweb-config
+              key: FORTIWEB_IP
+        - name: FORTIWEB_INSTANCE_ID
+          valueFrom:
+            secretKeyRef:
+              name: fortiweb-config
+              key: instance_id
+        - name: FORTIWEB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: fortiweb-credentials
+              key: password

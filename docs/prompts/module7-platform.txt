@@ -1,0 +1,320 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 7 - CORE PLATFORM
+================================================================================
+
+## Task
+
+Deploy core platform components via FluxCD GitOps:
+- External Secrets Operator
+- CloudWatch Agent (Container Insights)
+- Fluent Bit (log aggregation)
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Deployment Method: FluxCD HelmRelease
+- Specification: See `spec/module7_core_platform.txt` for full details
+
+## Prerequisites
+
+- [ ] Module 5 (IRSA) completed - role ARNs available
+- [ ] Module 6 (FluxCD) completed - FluxCD running
+- [ ] HelmRepositories created (external-secrets, eks-charts)
+
+## Steps
+
+### 1. Create Cluster Config
+
+Store Terraform outputs for FluxCD variable substitution:
+
+```bash
+cd gitops-platform
+
+cat > clusters/dev/flux-system/cluster-config.yaml << EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-config
+  namespace: flux-system
+data:
+  CLUSTER_NAME: "xperts-dev"
+  AWS_REGION: "ca-central-1"
+  ESO_ROLE_ARN: "arn:aws:iam::123456789012:role/xperts-dev-external-secrets"
+  CLOUDWATCH_ROLE_ARN: "arn:aws:iam::123456789012:role/xperts-dev-cloudwatch-agent"
+  FLUENT_BIT_ROLE_ARN: "arn:aws:iam::123456789012:role/xperts-dev-fluent-bit"
+EOF
+```
+
+### 2. Update Infrastructure Kustomization
+
+Enable variable substitution:
+
+```bash
+cat > clusters/dev/infrastructure.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  interval: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/infrastructure
+  prune: true
+  wait: true
+  timeout: 10m
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-config
+EOF
+```
+
+### 3. Create Namespaces
+
+```bash
+cat > clusters/dev/infrastructure/namespaces.yaml << 'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amazon-cloudwatch
+EOF
+```
+
+### 4. Deploy External Secrets Operator
+
+```bash
+mkdir -p clusters/dev/infrastructure/external-secrets
+
+cat > clusters/dev/infrastructure/external-secrets/helmrelease.yaml << 'EOF'
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: external-secrets
+  namespace: external-secrets
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: external-secrets
+      version: "0.9.x"
+      sourceRef:
+        kind: HelmRepository
+        name: external-secrets
+        namespace: flux-system
+  values:
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: ${ESO_ROLE_ARN}
+EOF
+
+cat > clusters/dev/infrastructure/external-secrets/clustersecretstore.yaml << 'EOF'
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ${AWS_REGION}
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+EOF
+
+cat > clusters/dev/infrastructure/external-secrets/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - helmrelease.yaml
+  - clustersecretstore.yaml
+EOF
+```
+
+### 5. Deploy CloudWatch Agent
+
+```bash
+mkdir -p clusters/dev/infrastructure/cloudwatch
+
+cat > clusters/dev/infrastructure/cloudwatch/helmrelease.yaml << 'EOF'
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: aws-cloudwatch-metrics
+  namespace: amazon-cloudwatch
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: aws-cloudwatch-metrics
+      version: "0.0.x"
+      sourceRef:
+        kind: HelmRepository
+        name: eks-charts
+        namespace: flux-system
+  values:
+    clusterName: ${CLUSTER_NAME}
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: ${CLOUDWATCH_ROLE_ARN}
+    tolerations:
+      - operator: Exists
+EOF
+
+cat > clusters/dev/infrastructure/cloudwatch/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - helmrelease.yaml
+EOF
+```
+
+### 6. Deploy Fluent Bit
+
+```bash
+mkdir -p clusters/dev/infrastructure/fluent-bit
+
+cat > clusters/dev/infrastructure/fluent-bit/helmrelease.yaml << 'EOF'
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: fluent-bit
+  namespace: amazon-cloudwatch
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: aws-for-fluent-bit
+      version: "0.1.x"
+      sourceRef:
+        kind: HelmRepository
+        name: eks-charts
+        namespace: flux-system
+  values:
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: ${FLUENT_BIT_ROLE_ARN}
+    cloudWatch:
+      enabled: true
+      region: ${AWS_REGION}
+      logGroupName: /aws/eks/${CLUSTER_NAME}/containers
+      logRetentionDays: 14
+    firehose:
+      enabled: false
+    kinesis:
+      enabled: false
+    elasticsearch:
+      enabled: false
+    tolerations:
+      - operator: Exists
+EOF
+
+cat > clusters/dev/infrastructure/fluent-bit/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - helmrelease.yaml
+EOF
+```
+
+### 7. Update Main Kustomization
+
+```bash
+cat > clusters/dev/infrastructure/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespaces.yaml
+  - sources.yaml
+  - external-secrets/
+  - cloudwatch/
+  - fluent-bit/
+EOF
+```
+
+### 8. Commit and Deploy
+
+```bash
+git add .
+git commit -m "Add core platform components"
+git push
+```
+
+### 9. Verify Deployment
+
+```bash
+# Watch reconciliation
+flux get kustomizations -w
+
+# Check HelmReleases
+flux get helmreleases -A
+
+# Verify ESO
+kubectl get pods -n external-secrets
+kubectl get clustersecretstores
+
+# Verify CloudWatch
+kubectl get pods -n amazon-cloudwatch
+```
+
+## Testing
+
+### External Secrets
+```bash
+# Create test secret in AWS
+aws secretsmanager create-secret \
+  --name dev/test/secret \
+  --secret-string '{"key": "value"}'
+
+# Create ExternalSecret
+cat << 'EOF' | kubectl apply -f -
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: test-secret
+  namespace: default
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: test-secret
+  data:
+    - secretKey: key
+      remoteRef:
+        key: dev/test/secret
+        property: key
+EOF
+
+# Verify sync
+kubectl get externalsecret test-secret
+kubectl get secret test-secret -o yaml
+```
+
+### CloudWatch
+```bash
+# Check Container Insights in AWS Console
+# CloudWatch > Container Insights > Performance monitoring
+
+# Or via CLI
+aws cloudwatch list-metrics --namespace ContainerInsights
+```
+
+## Reference
+
+- Full specification: `spec/module7_core_platform.txt`
+- ADR: `architecture/adr/005-external-secrets-operator.md`
+- ADR: `architecture/adr/008-cloudwatch-observability.md`
+
+================================================================================

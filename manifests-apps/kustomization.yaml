@@ -1,0 +1,11 @@
+# =============================================================================
+# Applications Root Kustomization
+# =============================================================================
+# This file tells ArgoCD to include all application subdirectories.
+# Add new applications by adding their directory to the resources list.
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - xperts

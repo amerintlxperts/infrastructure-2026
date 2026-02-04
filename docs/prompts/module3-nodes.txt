@@ -1,0 +1,162 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 3 - NODE GROUPS
+================================================================================
+
+## Task
+
+Implement EKS managed node groups with launch template customization using
+Terraform.
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Instance Types: t3.medium, t3.large (fallback)
+- Capacity: 1-4 nodes, desired 2
+- Specification: See `spec/module3_node_groups.txt` for full details
+
+## Prerequisites
+
+- [ ] Module 1 (VPC) completed
+- [ ] Module 2 (EKS) completed
+- [ ] Cluster is running and accessible
+
+## Deliverables
+
+```
+terraform/modules/node-groups/
+├── main.tf            # EKS node group resource
+├── iam.tf             # Node IAM role and policies
+├── launch_template.tf # Launch template with customization
+├── variables.tf
+├── outputs.tf
+└── README.md
+```
+
+## Implementation Requirements
+
+### 1. Node IAM Role
+
+Required policies:
+- `AmazonEKSWorkerNodePolicy`
+- `AmazonEKS_CNI_Policy`
+- `AmazonEC2ContainerRegistryReadOnly`
+- `AmazonSSMManagedInstanceCore` (optional, for debugging)
+
+### 2. Launch Template
+
+```hcl
+resource "aws_launch_template" "eks_nodes" {
+  name = "${var.project_name}-${var.environment}-eks-nodes"
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = 50
+      volume_type           = "gp3"
+      iops                  = 3000
+      encrypted             = true
+      kms_key_id            = var.kms_key_arn
+      delete_on_termination = true
+    }
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"  # IMDSv2 only
+    http_put_response_hop_limit = 2           # Required for VPC CNI
+  }
+
+  monitoring {
+    enabled = true
+  }
+}
+```
+
+### 3. Managed Node Group
+
+```hcl
+resource "aws_eks_node_group" "main" {
+  cluster_name    = var.cluster_name
+  node_group_name = "${var.project_name}-${var.environment}-general"
+  node_role_arn   = aws_iam_role.eks_nodes.arn
+  subnet_ids      = var.private_subnet_ids
+
+  instance_types = ["t3.medium", "t3.large"]
+  capacity_type  = "ON_DEMAND"
+
+  scaling_config {
+    desired_size = 2
+    min_size     = 1
+    max_size     = 4
+  }
+
+  launch_template {
+    id      = aws_launch_template.eks_nodes.id
+    version = aws_launch_template.eks_nodes.latest_version
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  labels = {
+    role        = "general"
+    environment = var.environment
+  }
+
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+}
+```
+
+### 4. Key Settings
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| IMDSv2 | required | Security best practice |
+| hop_limit | 2 | VPC CNI needs metadata access |
+| volume_type | gp3 | Better price/performance |
+| encrypted | true | Security requirement |
+| max_unavailable | 1 | Safe rolling updates |
+
+## Testing
+
+```bash
+# Check node group status
+aws eks describe-nodegroup \
+  --cluster-name xperts-dev \
+  --nodegroup-name xperts-dev-general
+
+# Verify nodes registered
+kubectl get nodes
+
+# Check node capacity
+kubectl describe node NODE_NAME | grep -A5 Capacity
+
+# Verify pods can schedule
+kubectl run test --rm -it --image=busybox -- echo "OK"
+```
+
+## Expected Outputs
+
+```hcl
+output "node_group_id" {}
+output "node_group_arn" {}
+output "node_role_arn" {}
+output "node_security_group_id" {}  # If created here
+```
+
+## Important Notes
+
+- Node group creation takes ~5-10 minutes
+- Multiple instance types improve availability
+- Spot instances can save ~70% but may be interrupted
+- t3.medium supports ~17 pods (ENI limits)
+
+## Reference
+
+- Full specification: `spec/module3_node_groups.txt`
+- ADR: `architecture/adr/001-eks-managed-node-groups.md`
+
+================================================================================

@@ -1,0 +1,566 @@
+================================================================================
+MODULE 3: NODE GROUPS SPECIFICATION
+================================================================================
+
+## Overview
+
+This module creates EKS managed node groups that provide the compute capacity
+for running Kubernetes workloads. Node groups are Auto Scaling groups of EC2
+instances managed by EKS for simplified operations.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         EKS Managed Node Group                              │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                      Auto Scaling Group                                │  │
+│  │                                                                        │  │
+│  │  ┌─────────────────────────┐    ┌─────────────────────────┐          │  │
+│  │  │    EC2 Instance         │    │    EC2 Instance         │          │  │
+│  │  │    (ca-central-1a)      │    │    (ca-central-1b)      │          │  │
+│  │  │                         │    │                         │          │  │
+│  │  │  Instance Type:         │    │  Instance Type:         │          │  │
+│  │  │  t3.medium              │    │  t3.medium              │          │  │
+│  │  │                         │    │                         │          │  │
+│  │  │  ┌─────────────────┐   │    │  ┌─────────────────┐   │          │  │
+│  │  │  │ Primary ENI     │   │    │  │ Primary ENI     │   │          │  │
+│  │  │  │ 10.0.10.x       │   │    │  │ 10.0.11.x       │   │          │  │
+│  │  │  └─────────────────┘   │    │  └─────────────────┘   │          │  │
+│  │  │                         │    │                         │          │  │
+│  │  │  ┌─────────────────┐   │    │  ┌─────────────────┐   │          │  │
+│  │  │  │ Secondary ENIs  │   │    │  │ Secondary ENIs  │   │          │  │
+│  │  │  │ (VPC CNI pods)  │   │    │  │ (VPC CNI pods)  │   │          │  │
+│  │  │  │ 10.0.10.x/y/z   │   │    │  │ 10.0.11.x/y/z   │   │          │  │
+│  │  │  └─────────────────┘   │    │  └─────────────────┘   │          │  │
+│  │  │                         │    │                         │          │  │
+│  │  │  Pods:                  │    │  Pods:                  │          │  │
+│  │  │  - coredns             │    │  - aws-node             │          │  │
+│  │  │  - kube-proxy          │    │  - kube-proxy           │          │  │
+│  │  │  - app pods            │    │  - app pods             │          │  │
+│  │  └─────────────────────────┘    └─────────────────────────┘          │  │
+│  │                                                                        │  │
+│  │  Scaling: min=1, desired=2, max=4                                     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  Configuration:                                                             │
+│  - AMI: Amazon Linux 2023 EKS Optimized                                    │
+│  - Disk: 50GB gp3                                                          │
+│  - Labels: role=general                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **Managed Node Groups**
+   - Auto Scaling integration
+   - AMI management and updates
+   - Node lifecycle (drain, terminate, replace)
+
+2. **Instance Configuration**
+   - Instance type selection criteria
+   - EBS volume configuration
+   - User data and launch templates
+
+3. **VPC CNI**
+   - Secondary ENIs for pod IPs
+   - IP address capacity planning
+   - Warm pool configuration
+
+4. **Node IAM**
+   - Node instance profile
+   - Required managed policies
+   - Additional permissions for ECR, etc.
+
+## Component Deep Dive
+
+### 1. Node IAM Role
+
+**Purpose**: Allows nodes to interact with AWS services
+
+```hcl
+resource "aws_iam_role" "eks_nodes" {
+  name = "${var.project_name}-${var.environment}-eks-nodes"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-nodes-role"
+  }
+}
+
+# Required policies for EKS nodes
+resource "aws_iam_role_policy_attachment" "eks_worker_node" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_read" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+# For SSM access (optional, useful for debugging)
+resource "aws_iam_role_policy_attachment" "ssm" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  role       = aws_iam_role.eks_nodes.name
+}
+```
+
+**Required Policies Explained**:
+
+| Policy | Purpose |
+|--------|---------|
+| AmazonEKSWorkerNodePolicy | Node registration with control plane |
+| AmazonEKS_CNI_Policy | VPC CNI to manage ENIs for pod IPs |
+| AmazonEC2ContainerRegistryReadOnly | Pull images from ECR |
+| AmazonSSMManagedInstanceCore | Optional: SSM access for debugging |
+
+### 2. Launch Template
+
+**Purpose**: Customize node configuration beyond node group defaults
+
+```hcl
+resource "aws_launch_template" "eks_nodes" {
+  name = "${var.project_name}-${var.environment}-eks-nodes"
+
+  # Block device configuration
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      volume_size           = 50
+      volume_type           = "gp3"
+      iops                  = 3000
+      throughput            = 125
+      encrypted             = true
+      kms_key_id            = var.kms_key_arn
+      delete_on_termination = true
+    }
+  }
+
+  # Metadata options (IMDSv2 required)
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"  # IMDSv2 only
+    http_put_response_hop_limit = 2           # Required for VPC CNI
+  }
+
+  # Enable detailed monitoring
+  monitoring {
+    enabled = true
+  }
+
+  # Tags for instances
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "${var.project_name}-${var.environment}-eks-node"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+
+    tags = {
+      Name = "${var.project_name}-${var.environment}-eks-node-volume"
+    }
+  }
+
+  # User data for custom configuration (optional)
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    # Custom node bootstrap (optional)
+    # EKS optimized AMI handles most configuration
+
+    # Example: Set kubelet max pods (if using custom CNI config)
+    # echo "KUBELET_EXTRA_ARGS=--max-pods=110" >> /etc/eks/bootstrap.sh.d/kubelet.env
+  EOF
+  )
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-launch-template"
+  }
+}
+```
+
+**Key Settings Explained**:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| volume_size | 50GB | Sufficient for container images + logs |
+| volume_type | gp3 | Better price/performance than gp2 |
+| http_tokens | required | IMDSv2 for security |
+| hop_limit | 2 | Required for VPC CNI pod metadata |
+| encrypted | true | Encrypt node volumes |
+
+### 3. Managed Node Group
+
+**Purpose**: EKS-managed Auto Scaling group of EC2 instances
+
+```hcl
+resource "aws_eks_node_group" "main" {
+  cluster_name    = var.cluster_name
+  node_group_name = "${var.project_name}-${var.environment}-general"
+  node_role_arn   = aws_iam_role.eks_nodes.arn
+  subnet_ids      = var.private_subnet_ids
+
+  # Instance configuration
+  instance_types = ["t3.medium", "t3.large"]  # Multiple for availability
+  capacity_type  = "ON_DEMAND"                 # or "SPOT" for cost savings
+
+  # Scaling configuration
+  scaling_config {
+    desired_size = 2
+    min_size     = 1
+    max_size     = 4
+  }
+
+  # Use launch template for customization
+  launch_template {
+    id      = aws_launch_template.eks_nodes.id
+    version = aws_launch_template.eks_nodes.latest_version
+  }
+
+  # Update configuration
+  update_config {
+    max_unavailable = 1  # Rolling update: 1 node at a time
+  }
+
+  # Node labels
+  labels = {
+    role        = "general"
+    environment = var.environment
+  }
+
+  # Taints (optional - for dedicated workloads)
+  # taint {
+  #   key    = "dedicated"
+  #   value  = "ml"
+  #   effect = "NO_SCHEDULE"
+  # }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node,
+    aws_iam_role_policy_attachment.eks_cni,
+    aws_iam_role_policy_attachment.ecr_read
+  ]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-node-group"
+  }
+
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+}
+```
+
+**Scaling Configuration**:
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| desired_size | 2 | Initial nodes for availability |
+| min_size | 1 | Allow scale down to reduce costs |
+| max_size | 4 | Cap for cost control |
+| max_unavailable | 1 | Safe rolling updates |
+
+**Why Multiple Instance Types**:
+- Improves availability if one type has capacity issues
+- EKS will use available type when scaling
+
+### 4. Node Security Group
+
+**Purpose**: Control traffic to/from nodes
+
+```hcl
+resource "aws_security_group" "eks_nodes" {
+  name        = "${var.project_name}-${var.environment}-eks-nodes"
+  description = "Security group for EKS nodes"
+  vpc_id      = var.vpc_id
+
+  # Inter-node communication
+  ingress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    self      = true
+    description = "Node to node all traffic"
+  }
+
+  # Control plane to nodes
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [var.cluster_security_group_id]
+    description     = "Control plane to nodes (443)"
+  }
+
+  ingress {
+    from_port       = 10250
+    to_port         = 10250
+    protocol        = "tcp"
+    security_groups = [var.cluster_security_group_id]
+    description     = "Control plane to kubelet"
+  }
+
+  # Allow all egress
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All egress"
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-eks-nodes-sg"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+  }
+}
+```
+
+## Instance Type Selection
+
+### For Development (Cost-Optimized)
+
+| Type | vCPU | Memory | Max Pods | Monthly Cost |
+|------|------|--------|----------|--------------|
+| t3.medium | 2 | 4 GB | 17 | ~$30 |
+| t3.large | 2 | 8 GB | 35 | ~$60 |
+
+### For Production (Performance)
+
+| Type | vCPU | Memory | Max Pods | Monthly Cost |
+|------|------|--------|----------|--------------|
+| m5.large | 2 | 8 GB | 29 | ~$70 |
+| m5.xlarge | 4 | 16 GB | 58 | ~$140 |
+
+### Max Pods Calculation
+
+Formula: `(ENIs × (IPs per ENI - 1)) + 2`
+
+For t3.medium (3 ENIs, 6 IPs/ENI):
+`(3 × (6 - 1)) + 2 = 17 pods`
+
+## Step-by-Step Implementation
+
+### Step 1: Create IAM Resources
+
+File: `terraform/modules/node-groups/iam.tf`
+- Node IAM role
+- Policy attachments
+
+### Step 2: Create Launch Template
+
+File: `terraform/modules/node-groups/launch_template.tf`
+- Block device mapping
+- Metadata options
+- Tags
+
+### Step 3: Create Node Group
+
+File: `terraform/modules/node-groups/main.tf`
+- EKS node group resource
+- Scaling configuration
+
+### Step 4: Create Outputs
+
+File: `terraform/modules/node-groups/outputs.tf`
+```hcl
+output "node_group_id" {
+  description = "Node group ID"
+  value       = aws_eks_node_group.main.id
+}
+
+output "node_group_arn" {
+  description = "Node group ARN"
+  value       = aws_eks_node_group.main.arn
+}
+
+output "node_group_status" {
+  description = "Node group status"
+  value       = aws_eks_node_group.main.status
+}
+
+output "node_security_group_id" {
+  description = "Node security group ID"
+  value       = aws_security_group.eks_nodes.id
+}
+
+output "node_role_arn" {
+  description = "Node IAM role ARN"
+  value       = aws_iam_role.eks_nodes.arn
+}
+```
+
+## Testing and Validation
+
+### Terraform Validation
+```bash
+terraform fmt -check
+terraform validate
+```
+
+### Node Group Verification
+```bash
+# Check node group status
+aws eks describe-nodegroup \
+  --cluster-name CLUSTER \
+  --nodegroup-name general
+
+# Verify nodes registered
+kubectl get nodes
+
+# Check node details
+kubectl describe node NODE_NAME
+
+# Verify pods can schedule
+kubectl get pods -A
+```
+
+### Capacity Verification
+```bash
+# Check allocatable resources
+kubectl describe node NODE_NAME | grep -A5 Allocatable
+
+# Check max pods
+kubectl get node NODE_NAME -o jsonpath='{.status.capacity.pods}'
+```
+
+## Troubleshooting
+
+### Nodes Not Joining Cluster
+
+**Symptoms**: Nodes stuck in "Creating" state
+
+**Check**:
+```bash
+# Check Auto Scaling group
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ASG_NAME
+
+# Check instance status
+aws ec2 describe-instances --instance-ids INSTANCE_ID
+
+# Check instance system log (if SSM available)
+aws ssm start-session --target INSTANCE_ID
+journalctl -u kubelet
+```
+
+**Solutions**:
+- Verify node IAM role has required policies
+- Check security group allows control plane communication
+- Ensure private subnet has route to NAT Gateway
+- Verify VPC endpoints are accessible
+
+### Node Disk Full
+
+**Symptoms**: Pods evicted with "DiskPressure"
+
+**Check**:
+```bash
+kubectl describe node NODE_NAME | grep -i disk
+```
+
+**Solutions**:
+- Increase volume_size in launch template
+- Clean up unused container images
+- Implement log rotation
+
+### Pod IP Exhaustion
+
+**Symptoms**: Pods stuck in "Pending" with IP allocation errors
+
+**Check**:
+```bash
+# Check VPC CNI logs
+kubectl logs -n kube-system -l k8s-app=aws-node
+
+# Check IP pool
+kubectl get nodes -o jsonpath='{.items[*].status.addresses}'
+```
+
+**Solutions**:
+- Scale up nodes (more ENIs = more IPs)
+- Consider custom networking with secondary CIDR
+- Adjust VPC CNI warm pool settings
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| 2x t3.medium On-Demand | ~$60 | Base compute |
+| EBS (2x 50GB gp3) | ~$8 | Node volumes |
+| Data transfer | Variable | Cross-AZ traffic |
+| **Total** | ~$68/month | 2 nodes |
+
+### Cost Optimization Options
+
+1. **Spot Instances**: Up to 70% savings
+   ```hcl
+   capacity_type = "SPOT"
+   ```
+
+2. **Scale to Zero** when idle (nights/weekends):
+   ```bash
+   aws eks update-nodegroup-config \
+     --cluster-name CLUSTER \
+     --nodegroup-name general \
+     --scaling-config desiredSize=0,minSize=0,maxSize=4
+   ```
+
+3. **Smaller instances** for light workloads
+
+## Security Considerations
+
+1. **IMDSv2 Required**: Prevents SSRF attacks on metadata service
+2. **Encrypted Volumes**: EBS encryption with KMS
+3. **SSM Access**: Audit via CloudTrail instead of SSH
+4. **Security Groups**: Least privilege, explicit rules
+5. **Node IAM**: Minimal required policies only
+
+## Files to Create
+
+```
+terraform/modules/node-groups/
+├── main.tf           # EKS node group resource
+├── iam.tf            # Node IAM role and policies
+├── launch_template.tf # Launch template configuration
+├── security_groups.tf # Node security group
+├── variables.tf      # Input variables
+├── outputs.tf        # Output values
+└── README.md         # Module documentation
+```
+
+## Dependencies
+
+- **Depends on**: Module 1 (VPC), Module 2 (EKS Cluster)
+- **Required by**: Module 6 (FluxCD Bootstrap), Module 7 (Core Platform)
+
+## Next Module
+
+After completing this module, proceed to:
+**Module 4: ECR & Registry** - Sets up ECR pull-through cache for GHCR images.

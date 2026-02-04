@@ -1,0 +1,154 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 4 - ECR & REGISTRY
+================================================================================
+
+## Task
+
+Configure ECR pull-through cache for GHCR images using Terraform.
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Upstream Registry: ghcr.io
+- GitHub Org: amerintlxperts
+- Specification: See `spec/module4_ecr_registry.txt` for full details
+
+## Prerequisites
+
+- [ ] Module 1 (VPC) completed
+- [ ] GitHub Personal Access Token with `read:packages` scope
+
+## Deliverables
+
+```
+terraform/modules/ecr/
+├── main.tf        # Pull-through cache rule
+├── secrets.tf     # GHCR credential in Secrets Manager
+├── registry.tf    # Registry scanning configuration
+├── variables.tf
+├── outputs.tf
+└── README.md
+```
+
+## Implementation Requirements
+
+### 1. GHCR Credential Secret
+
+```hcl
+resource "aws_secretsmanager_secret" "ghcr_token" {
+  name                    = "${var.project_name}-${var.environment}-ghcr-token"
+  recovery_window_in_days = 0  # For dev, allow immediate deletion
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-ghcr-token"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "ghcr_token" {
+  secret_id = aws_secretsmanager_secret.ghcr_token.id
+  secret_string = jsonencode({
+    username = var.github_org
+    password = var.ghcr_token
+  })
+}
+```
+
+### 2. Pull-Through Cache Rule
+
+```hcl
+resource "aws_ecr_pull_through_cache_rule" "ghcr" {
+  ecr_repository_prefix = "ghcr"
+  upstream_registry_url = "ghcr.io"
+  credential_arn        = aws_secretsmanager_secret.ghcr_token.arn
+}
+```
+
+### 3. Registry Scanning (Optional)
+
+```hcl
+resource "aws_ecr_registry_scanning_configuration" "main" {
+  scan_type = "BASIC"
+
+  rule {
+    scan_frequency = "SCAN_ON_PUSH"
+    repository_filter {
+      filter      = "ghcr/*"
+      filter_type = "WILDCARD"
+    }
+  }
+}
+```
+
+### 4. Image Reference Pattern
+
+Original GHCR:
+```
+ghcr.io/amerintlxperts/my-app:v1.0.0
+```
+
+ECR Pull-through:
+```
+123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app:v1.0.0
+```
+
+## Testing
+
+```bash
+# Check cache rule exists
+aws ecr describe-pull-through-cache-rules
+
+# Login to ECR
+aws ecr get-login-password --region ca-central-1 | \
+  docker login --username AWS --password-stdin \
+  123456789012.dkr.ecr.ca-central-1.amazonaws.com
+
+# Test pull (will cache on first pull)
+docker pull 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/my-app:v1.0.0
+
+# Verify repository was created
+aws ecr describe-repositories --repository-names ghcr/amerintlxperts/my-app
+```
+
+## Expected Outputs
+
+```hcl
+output "ecr_registry_url" {
+  value = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"
+}
+
+output "ghcr_prefix" {
+  value = "ghcr"
+}
+
+output "ghcr_credential_secret_arn" {
+  value = aws_secretsmanager_secret.ghcr_token.arn
+}
+```
+
+## Providing GHCR Token
+
+The GHCR token should be provided via:
+
+Option 1: Environment variable
+```bash
+export TF_VAR_ghcr_token="ghp_xxxxxxxxxxxx"
+terraform apply
+```
+
+Option 2: Terraform variable prompt (not recommended for CI)
+
+Option 3: Terraform Cloud sensitive variable
+
+## Important Notes
+
+- First pull always goes to GHCR (cache miss)
+- Subsequent pulls are fast (cache hit)
+- Repositories are auto-created on first pull
+- Node IAM role needs `AmazonEC2ContainerRegistryReadOnly`
+
+## Reference
+
+- Full specification: `spec/module4_ecr_registry.txt`
+- ADR: `architecture/adr/004-ecr-pull-through-cache.md`
+
+================================================================================

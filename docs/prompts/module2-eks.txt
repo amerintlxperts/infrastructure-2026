@@ -1,0 +1,170 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 2 - EKS CLUSTER
+================================================================================
+
+## Task
+
+Implement the EKS control plane with OIDC provider for IRSA, KMS encryption,
+and EKS add-ons using Terraform.
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Region: ca-central-1
+- EKS Version: 1.31
+- Specification: See `spec/module2_eks_cluster.txt` for full details
+
+## Prerequisites
+
+- [ ] Module 1 (VPC) completed and applied
+- [ ] VPC ID and subnet IDs available as outputs
+
+## Deliverables
+
+```
+terraform/modules/eks/
+├── main.tf            # EKS cluster resource
+├── iam.tf             # Cluster IAM role, OIDC provider
+├── kms.tf             # KMS key for secrets encryption
+├── security_groups.tf # Cluster and node security groups
+├── addons.tf          # VPC CNI, CoreDNS, kube-proxy
+├── variables.tf
+├── outputs.tf
+└── README.md
+```
+
+## Implementation Requirements
+
+### 1. EKS Cluster
+
+```hcl
+resource "aws_eks_cluster" "main" {
+  name     = "${var.project_name}-${var.environment}"
+  version  = "1.31"
+  role_arn = aws_iam_role.eks_cluster.arn
+
+  vpc_config {
+    subnet_ids              = var.private_subnet_ids
+    endpoint_private_access = true
+    endpoint_public_access  = true
+    public_access_cidrs     = var.public_access_cidrs  # Restrict!
+    security_group_ids      = [aws_security_group.eks_cluster.id]
+  }
+
+  enabled_cluster_log_types = ["api", "audit", "authenticator"]
+
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks.arn
+    }
+    resources = ["secrets"]
+  }
+}
+```
+
+### 2. OIDC Provider (for IRSA)
+
+```hcl
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+}
+```
+
+### 3. Cluster IAM Role
+
+Required policy attachments:
+- `arn:aws:iam::aws:policy/AmazonEKSClusterPolicy`
+
+### 4. KMS Key
+
+```hcl
+resource "aws_kms_key" "eks" {
+  description             = "KMS key for EKS secret encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+}
+```
+
+### 5. Security Groups
+
+**Cluster Security Group**:
+- Egress to nodes on 443, 10250
+- Ingress from nodes on 443
+
+**Node Security Group** (create here, used by Module 3):
+- Ingress from self (node-to-node)
+- Ingress from cluster on 443, 10250
+- Egress all
+
+### 6. EKS Add-ons
+
+```hcl
+# VPC CNI
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "vpc-cni"
+  # ... use latest compatible version
+}
+
+# CoreDNS (depends on nodes)
+resource "aws_eks_addon" "coredns" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "coredns"
+  depends_on   = [aws_eks_node_group.main]  # From Module 3
+}
+
+# kube-proxy
+resource "aws_eks_addon" "kube_proxy" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "kube-proxy"
+}
+```
+
+## Testing
+
+```bash
+# Update kubeconfig
+aws eks update-kubeconfig --region ca-central-1 --name xperts-dev
+
+# Verify cluster
+kubectl cluster-info
+
+# Check OIDC provider
+aws iam list-open-id-connect-providers
+
+# Check add-ons
+aws eks describe-addon --cluster-name xperts-dev --addon-name vpc-cni
+```
+
+## Expected Outputs
+
+```hcl
+output "cluster_name" {}
+output "cluster_endpoint" {}
+output "cluster_certificate_authority" {}
+output "cluster_security_group_id" {}
+output "node_security_group_id" {}
+output "oidc_provider_arn" {}
+output "oidc_provider_url" {}  # Without https://
+```
+
+## Important Notes
+
+- Cluster creation takes ~10-15 minutes
+- CoreDNS addon requires nodes to be running
+- OIDC URL must not have `https://` prefix in IRSA trust policies
+- Control plane logs go to `/aws/eks/CLUSTER_NAME/cluster`
+
+## Reference
+
+- Full specification: `spec/module2_eks_cluster.txt`
+- ADR: `architecture/adr/001-eks-managed-node-groups.md`
+- ADR: `architecture/adr/002-irsa-for-aws-authentication.md`
+
+================================================================================

@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # CRD and controller deployment from fortiweb_crds repo (pinned to specific commit)
+  - https://github.com/40docs/crds_fortiweb//crds?ref=6278e1d496e827324113160094e146e8ca5dd212
+  - https://github.com/40docs/crds_fortiweb//deploy?ref=6278e1d496e827324113160094e146e8ca5dd212
+  # Local resources
+  - certificates.yaml
+  - gateway.yaml
+
+# Pin image to commit SHA tag (built by GitHub Actions)
+images:
+  - name: ghcr.io/40docs/crds_fortiweb
+    newTag: 6278e1d

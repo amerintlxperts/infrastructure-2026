@@ -1,0 +1,38 @@
+# =============================================================================
+# FortiWeb Password Bootstrap Job
+# =============================================================================
+# Automatically changes the FortiWeb admin password from the default
+# (instance-id) to the password stored in AWS Secrets Manager.
+#
+# This runs BEFORE the FortiWeb Ingress Controller (sync-wave 2.5 vs 3)
+# so the IC can use admin credentials with full VIP creation permissions.
+#
+# IDEMPOTENCY:
+# - Job tries the new password first; exits early if already set
+# - On FortiWeb replacement, Terraform updates instance_id in secret
+# - Manual re-trigger: kubectl delete job fortiweb-password-bootstrap -n fortiweb-controller
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fortiweb-bootstrap
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2.5"  # After platform-resources (2), before IC (3)
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:amerintlxperts/infrastructure-2026.git
+    path: manifests-platform/resources/fortiweb-bootstrap
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fortiweb-controller
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,64 @@
+# DNSEndpoint CRD for external-dns
+# Allows programmatic DNS record management via Kubernetes custom resources
+# Used by FortiWeb controller to create Route53 records for apps
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: dnsendpoints.externaldns.k8s.io
+  annotations:
+    api-approved.kubernetes.io: "https://github.com/kubernetes-sigs/external-dns/pull/2007"
+spec:
+  group: externaldns.k8s.io
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                endpoints:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      dnsName:
+                        type: string
+                      recordType:
+                        type: string
+                      targets:
+                        type: array
+                        items:
+                          type: string
+                      recordTTL:
+                        type: integer
+                      labels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      providerSpecific:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            name:
+                              type: string
+                            value:
+                              type: string
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+      subresources:
+        status: {}
+  scope: Namespaced
+  names:
+    plural: dnsendpoints
+    singular: dnsendpoint
+    kind: DNSEndpoint
+    shortNames:
+      - dep

@@ -1,0 +1,512 @@
+================================================================================
+MODULE 1: VPC & NETWORKING SPECIFICATION
+================================================================================
+
+## Overview
+
+This module creates the foundational VPC infrastructure for the EKS cluster,
+including subnets, route tables, NAT gateway, internet gateway, and VPC endpoints
+for private AWS service access.
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              VPC: 10.0.0.0/16                               │
+│                                                                             │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐  │
+│  │     Availability Zone A         │  │     Availability Zone B         │  │
+│  │                                 │  │                                 │  │
+│  │  ┌──────────────────────────┐  │  │  ┌──────────────────────────┐  │  │
+│  │  │ Public Subnet: 10.0.1.0/24│  │  │  │ Public Subnet: 10.0.2.0/24│  │  │
+│  │  │  - NAT Gateway           │  │  │  │  - (Reserved for HA)      │  │  │
+│  │  │  - FortiWeb (future)     │  │  │  │                           │  │  │
+│  │  └──────────────────────────┘  │  │  └──────────────────────────┘  │  │
+│  │                                 │  │                                 │  │
+│  │  ┌──────────────────────────┐  │  │  ┌──────────────────────────┐  │  │
+│  │  │Private Subnet: 10.0.10.0/24│ │  │  │Private Subnet: 10.0.11.0/24│ │  │
+│  │  │  - EKS Nodes             │  │  │  │  - EKS Nodes             │  │  │
+│  │  │  - Pod IPs               │  │  │  │  - Pod IPs               │  │  │
+│  │  └──────────────────────────┘  │  │  └──────────────────────────┘  │  │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘  │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                  VPC Endpoints Subnet: 10.0.100.0/24                 │  │
+│  │  - ecr.api, ecr.dkr, s3, secretsmanager, sts, logs, ec2             │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+         │                                              │
+         │ Internet Gateway                             │ VPC Endpoints
+         ▼                                              ▼
+    ┌─────────┐                                   ┌─────────────┐
+    │ Internet │                                  │ AWS Services │
+    └─────────┘                                   └─────────────┘
+```
+
+## Learning Objectives
+
+After implementing this module, you will understand:
+
+1. **VPC Fundamentals**
+   - How CIDR blocks divide IP address space
+   - Public vs private subnets
+   - Route table associations
+
+2. **AWS Networking**
+   - Internet Gateway for public access
+   - NAT Gateway for private subnet outbound
+   - VPC Endpoints for private AWS API access
+
+3. **EKS Networking Requirements**
+   - Subnet tagging for EKS discovery
+   - Secondary CIDR considerations for pods
+   - Cross-AZ deployment for high availability
+
+4. **Cost Optimization**
+   - VPC endpoint costs vs NAT data transfer
+   - Single NAT Gateway trade-offs
+
+## Component Deep Dive
+
+### 1. VPC
+
+**Purpose**: Isolated virtual network for all resources
+
+**Configuration**:
+```hcl
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true  # Required for EKS
+  enable_dns_support   = true  # Required for VPC endpoints
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-vpc"
+  }
+}
+```
+
+**Why these settings**:
+- `/16` CIDR provides 65,536 IPs (plenty for growth)
+- DNS hostnames required for EKS node registration
+- DNS support required for VPC endpoint resolution
+
+### 2. Subnets
+
+**Public Subnets** (2x /24 = 512 IPs):
+- Host NAT Gateway
+- Host FortiWeb ingress
+- Auto-assign public IPs
+
+**Private Subnets** (2x /24 = 512 IPs):
+- Host EKS nodes
+- Host pod IPs (VPC CNI)
+- No public IPs
+
+**VPC Endpoint Subnet** (1x /24):
+- Host interface endpoint ENIs
+- Shared across AZs
+
+**Terraform Pattern**:
+```hcl
+locals {
+  subnets = {
+    "public-a" = {
+      cidr              = "10.0.1.0/24"
+      az                = "ca-central-1a"
+      public            = true
+      eks_elb_tag       = "elb"
+    }
+    "public-b" = {
+      cidr              = "10.0.2.0/24"
+      az                = "ca-central-1b"
+      public            = true
+      eks_elb_tag       = "elb"
+    }
+    "private-a" = {
+      cidr              = "10.0.10.0/24"
+      az                = "ca-central-1a"
+      public            = false
+      eks_elb_tag       = "internal-elb"
+    }
+    "private-b" = {
+      cidr              = "10.0.11.0/24"
+      az                = "ca-central-1b"
+      public            = false
+      eks_elb_tag       = "internal-elb"
+    }
+    "endpoints" = {
+      cidr              = "10.0.100.0/24"
+      az                = "ca-central-1a"
+      public            = false
+      eks_elb_tag       = null
+    }
+  }
+}
+
+resource "aws_subnet" "main" {
+  for_each = local.subnets
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = each.value.cidr
+  availability_zone       = each.value.az
+  map_public_ip_on_launch = each.value.public
+
+  tags = merge(
+    {
+      Name = "${var.project_name}-${var.environment}-${each.key}"
+      "kubernetes.io/cluster/${local.cluster_name}" = "shared"
+    },
+    each.value.eks_elb_tag != null ? {
+      "kubernetes.io/role/${each.value.eks_elb_tag}" = "1"
+    } : {}
+  )
+}
+```
+
+**EKS Subnet Tags Explained**:
+- `kubernetes.io/cluster/CLUSTER_NAME = shared`: EKS can use this subnet
+- `kubernetes.io/role/elb = 1`: Public subnet for internet-facing LBs
+- `kubernetes.io/role/internal-elb = 1`: Private subnet for internal LBs
+
+### 3. Internet Gateway
+
+**Purpose**: Enables internet access for public subnets
+
+```hcl
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-igw"
+  }
+}
+```
+
+### 4. NAT Gateway
+
+**Purpose**: Enables outbound internet for private subnets
+
+```hcl
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-nat-eip"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.main["public-a"].id
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-nat"
+  }
+}
+```
+
+**Cost Note**: Single NAT for dev (~$32/month + data). For production,
+deploy one per AZ for high availability.
+
+### 5. Route Tables
+
+**Public Route Table**:
+```hcl
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-public-rt"
+  }
+}
+```
+
+**Private Route Table**:
+```hcl
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-private-rt"
+  }
+}
+```
+
+### 6. VPC Endpoints
+
+**Required Endpoints**:
+
+| Endpoint | Type | Purpose |
+|----------|------|---------|
+| ecr.api | Interface | ECR API calls |
+| ecr.dkr | Interface | Docker registry protocol |
+| s3 | Gateway | ECR image layers (free) |
+| secretsmanager | Interface | Secrets Manager access |
+| sts | Interface | IRSA token exchange |
+| logs | Interface | CloudWatch Logs |
+| ec2 | Interface | EC2 API (node management) |
+
+**Terraform Pattern**:
+```hcl
+locals {
+  interface_endpoints = {
+    "ecr.api"        = "com.amazonaws.${var.region}.ecr.api"
+    "ecr.dkr"        = "com.amazonaws.${var.region}.ecr.dkr"
+    "secretsmanager" = "com.amazonaws.${var.region}.secretsmanager"
+    "sts"            = "com.amazonaws.${var.region}.sts"
+    "logs"           = "com.amazonaws.${var.region}.logs"
+    "ec2"            = "com.amazonaws.${var.region}.ec2"
+  }
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each = local.interface_endpoints
+
+  vpc_id              = aws_vpc.main.id
+  service_name        = each.value
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.main["endpoints"].id]
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-${each.key}-endpoint"
+  }
+}
+
+# S3 Gateway endpoint (free, no ENI)
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-s3-endpoint"
+  }
+}
+```
+
+### 7. Security Groups
+
+**VPC Endpoints Security Group**:
+```hcl
+resource "aws_security_group" "vpc_endpoints" {
+  name        = "${var.project_name}-${var.environment}-vpc-endpoints"
+  description = "Security group for VPC endpoints"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "HTTPS from private subnets"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.eks_nodes.id]
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-vpc-endpoints-sg"
+  }
+}
+```
+
+## Step-by-Step Implementation
+
+### Step 1: Create Variables
+
+File: `terraform/modules/vpc/variables.tf`
+```hcl
+variable "project_name" {
+  description = "Project name for resource naming"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment (dev, staging, prod)"
+  type        = string
+}
+
+variable "region" {
+  description = "AWS region"
+  type        = string
+  default     = "ca-central-1"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "availability_zones" {
+  description = "List of availability zones"
+  type        = list(string)
+  default     = ["ca-central-1a", "ca-central-1b"]
+}
+```
+
+### Step 2: Create VPC Module
+
+File: `terraform/modules/vpc/main.tf`
+- Implement VPC, subnets, gateways, route tables
+- Use `for_each` for DRY subnet creation
+- Apply EKS-required tags
+
+### Step 3: Create VPC Endpoints Module
+
+File: `terraform/modules/vpc/endpoints.tf`
+- Implement interface endpoints with `for_each`
+- Implement S3 gateway endpoint
+- Create security group for endpoints
+
+### Step 4: Create Outputs
+
+File: `terraform/modules/vpc/outputs.tf`
+```hcl
+output "vpc_id" {
+  description = "VPC ID"
+  value       = aws_vpc.main.id
+}
+
+output "private_subnet_ids" {
+  description = "Private subnet IDs for EKS"
+  value       = [for k, v in aws_subnet.main : v.id if !local.subnets[k].public && k != "endpoints"]
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs"
+  value       = [for k, v in aws_subnet.main : v.id if local.subnets[k].public]
+}
+
+output "vpc_endpoints_security_group_id" {
+  description = "Security group ID for VPC endpoints"
+  value       = aws_security_group.vpc_endpoints.id
+}
+```
+
+## Testing and Validation
+
+### Terraform Validation
+```bash
+cd terraform/modules/vpc
+terraform fmt -check
+terraform validate
+```
+
+### Post-Apply Verification
+```bash
+# Verify VPC created
+aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*-vpc"
+
+# Verify subnets
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=VPC_ID"
+
+# Verify NAT Gateway
+aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=VPC_ID"
+
+# Verify VPC Endpoints
+aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=VPC_ID"
+```
+
+### Connectivity Test
+```bash
+# After EKS is deployed, test endpoint connectivity from a pod:
+kubectl run test --rm -it --image=amazonlinux -- bash
+curl -v https://sts.ca-central-1.amazonaws.com
+curl -v https://secretsmanager.ca-central-1.amazonaws.com
+```
+
+## Troubleshooting
+
+### NAT Gateway Not Working
+
+**Symptoms**: Private instances cannot reach internet
+
+**Check**:
+```bash
+# Verify route table association
+aws ec2 describe-route-tables --route-table-id rtb-xxx
+
+# Verify NAT Gateway state
+aws ec2 describe-nat-gateways --nat-gateway-id nat-xxx
+```
+
+**Solutions**:
+- Ensure private route table has 0.0.0.0/0 -> NAT Gateway
+- Ensure NAT Gateway is in public subnet
+- Ensure Internet Gateway exists
+
+### VPC Endpoint Connectivity
+
+**Symptoms**: Pods cannot reach AWS services
+
+**Check**:
+```bash
+# Test DNS resolution
+nslookup sts.ca-central-1.amazonaws.com
+
+# Should return VPC endpoint IP (10.0.x.x), not public IP
+```
+
+**Solutions**:
+- Ensure `private_dns_enabled = true` on endpoint
+- Ensure security group allows 443 from nodes
+- Ensure DNS support enabled on VPC
+
+## Cost Analysis
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| NAT Gateway | $32.40 | Fixed hourly rate |
+| NAT Data | ~$0.045/GB | Outbound through NAT |
+| VPC Endpoints (6) | ~$43.80 | $7.30/endpoint/month |
+| S3 Endpoint | Free | Gateway endpoint |
+| **Total** | ~$76/month | Excluding data transfer |
+
+### Cost Optimization Options
+
+1. **Use S3 Gateway** (free) instead of interface endpoint
+2. **Route AWS traffic through endpoints** to avoid NAT data charges
+3. **Consider PrivateLink** for high-volume AWS API calls
+
+## Security Considerations
+
+1. **No direct internet access** for nodes (must go through NAT)
+2. **VPC Flow Logs** enabled for network audit
+3. **Security groups** restrict endpoint access to cluster nodes
+4. **Private subnets** not directly routable from internet
+
+## Files to Create
+
+```
+terraform/modules/vpc/
+├── main.tf           # VPC, subnets, gateways, route tables
+├── endpoints.tf      # VPC endpoints
+├── security_groups.tf # Security groups
+├── variables.tf      # Input variables
+├── outputs.tf        # Output values
+└── README.md         # Module documentation
+```
+
+## Dependencies
+
+- **Depends on**: Nothing (first module)
+- **Required by**: Module 2 (EKS Cluster), Module 3 (Node Groups)
+
+## Next Module
+
+After completing this module, proceed to:
+**Module 2: EKS Cluster** - Creates the EKS control plane using the VPC
+created here.

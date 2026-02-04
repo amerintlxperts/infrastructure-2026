@@ -1,0 +1,69 @@
+# =============================================================================
+# TLS Certificates for FortiWebIngress Gateway
+# =============================================================================
+# Per-app TLS certificates managed by cert-manager. The FortiWebIngress
+# controller reads these secrets and uploads certificates to FortiWeb.
+#
+# Certificate secrets are created in fortiweb-controller namespace for
+# easy access by the controller.
+# =============================================================================
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: xperts-tls
+  namespace: fortiweb-controller
+spec:
+  secretName: xperts-tls
+  privateKey:
+    rotationPolicy: Always
+  commonName: xperts.amerintlxperts.com
+  dnsNames:
+    - xperts.amerintlxperts.com
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: canada-tls
+  namespace: fortiweb-controller
+spec:
+  secretName: canada-tls
+  privateKey:
+    rotationPolicy: Always
+  commonName: canada.amerintlxperts.com
+  dnsNames:
+    - canada.amerintlxperts.com
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: latam-tls
+  namespace: fortiweb-controller
+spec:
+  secretName: latam-tls
+  privateKey:
+    rotationPolicy: Always
+  commonName: latam.amerintlxperts.com
+  dnsNames:
+    - latam.amerintlxperts.com
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer

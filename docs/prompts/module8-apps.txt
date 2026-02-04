@@ -1,0 +1,342 @@
+================================================================================
+IMPLEMENTATION PROMPT: MODULE 8 - APPLICATIONS
+================================================================================
+
+## Task
+
+Deploy a sample application demonstrating platform capabilities:
+- Kustomize base/overlay pattern
+- External Secrets integration
+- ECR pull-through cache images
+- IRSA for AWS access
+
+## Context
+
+- Project: amerintlxperts EKS GitOps Platform
+- Pattern: Kustomize base with environment overlays
+- Specification: See `spec/module8_applications.txt` for full details
+
+## Prerequisites
+
+- [ ] Module 7 (Core Platform) completed
+- [ ] External Secrets Operator running
+- [ ] ClusterSecretStore configured
+- [ ] IRSA role created for application (optional)
+
+## Steps
+
+### 1. Create Application Structure
+
+```bash
+cd gitops-platform
+
+mkdir -p apps/sample-app/{base,overlays/dev}
+mkdir -p clusters/dev/apps
+```
+
+### 2. Create Base Manifests
+
+**Namespace**:
+```bash
+cat > apps/sample-app/base/namespace.yaml << 'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-app
+EOF
+```
+
+**ServiceAccount**:
+```bash
+cat > apps/sample-app/base/serviceaccount.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sample-app
+  annotations:
+    eks.amazonaws.com/role-arn: ""
+EOF
+```
+
+**ExternalSecret**:
+```bash
+cat > apps/sample-app/base/externalsecret.yaml << 'EOF'
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: sample-app-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: sample-app-secrets
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: dev/sample-app/database
+        property: url
+EOF
+```
+
+**Deployment**:
+```bash
+cat > apps/sample-app/base/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sample-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sample-app
+    spec:
+      serviceAccountName: sample-app
+      containers:
+        - name: app
+          image: ghcr.io/amerintlxperts/sample-app:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: sample-app-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+EOF
+```
+
+**Service**:
+```bash
+cat > apps/sample-app/base/service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app
+spec:
+  selector:
+    app.kubernetes.io/name: sample-app
+  ports:
+    - port: 80
+      targetPort: http
+EOF
+```
+
+**Base Kustomization**:
+```bash
+cat > apps/sample-app/base/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - externalsecret.yaml
+  - deployment.yaml
+  - service.yaml
+commonLabels:
+  app.kubernetes.io/name: sample-app
+EOF
+```
+
+### 3. Create Dev Overlay
+
+```bash
+cat > apps/sample-app/overlays/dev/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sample-app
+resources:
+  - ../../base
+# Transform image to ECR pull-through cache
+images:
+  - name: ghcr.io/amerintlxperts/sample-app
+    newName: 123456789012.dkr.ecr.ca-central-1.amazonaws.com/ghcr/amerintlxperts/sample-app
+    newTag: v1.0.0
+# Apply patches
+patches:
+  - path: serviceaccount-patch.yaml
+EOF
+
+cat > apps/sample-app/overlays/dev/serviceaccount-patch.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sample-app
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/xperts-dev-sample-app
+EOF
+```
+
+### 4. Create Cluster Reference
+
+```bash
+cat > clusters/dev/apps/sample-app.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: sample-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./apps/sample-app/overlays/dev
+  prune: true
+  wait: true
+  dependsOn:
+    - name: infrastructure
+EOF
+
+cat > clusters/dev/apps/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - sample-app.yaml
+EOF
+
+cat > clusters/dev/apps.yaml << 'EOF'
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./clusters/dev/apps
+  prune: true
+  dependsOn:
+    - name: infrastructure
+EOF
+```
+
+### 5. Create Application Secret
+
+```bash
+aws secretsmanager create-secret \
+  --name dev/sample-app/database \
+  --secret-string '{"url": "postgresql://user:pass@localhost:5432/db"}'
+```
+
+### 6. Commit and Deploy
+
+```bash
+git add .
+git commit -m "Add sample-app application"
+git push
+```
+
+### 7. Verify Deployment
+
+```bash
+# Watch reconciliation
+flux get kustomizations -w
+
+# Check deployment
+kubectl get deploy -n sample-app
+
+# Check pods
+kubectl get pods -n sample-app
+
+# Check secret sync
+kubectl get externalsecret -n sample-app
+kubectl get secret sample-app-secrets -n sample-app
+
+# Check logs
+kubectl logs -n sample-app -l app.kubernetes.io/name=sample-app
+```
+
+## Updating the Application
+
+### Update Image Tag
+
+```bash
+cd apps/sample-app/overlays/dev
+# Edit kustomization.yaml to change newTag
+git commit -am "Update sample-app to v1.1.0"
+git push
+```
+
+### Add Environment Variable
+
+```bash
+cat > apps/sample-app/overlays/dev/deployment-patch.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: FEATURE_FLAG
+              value: "enabled"
+EOF
+
+# Update kustomization.yaml to include patch
+git commit -am "Enable feature flag"
+git push
+```
+
+## Final Repository Structure
+
+```
+gitops-platform/
+├── clusters/dev/
+│   ├── flux-system/
+│   ├── infrastructure/
+│   │   ├── external-secrets/
+│   │   ├── cloudwatch/
+│   │   └── fluent-bit/
+│   ├── apps/
+│   │   ├── kustomization.yaml
+│   │   └── sample-app.yaml
+│   ├── infrastructure.yaml
+│   └── apps.yaml
+├── apps/
+│   └── sample-app/
+│       ├── base/
+│       │   ├── kustomization.yaml
+│       │   ├── namespace.yaml
+│       │   ├── serviceaccount.yaml
+│       │   ├── externalsecret.yaml
+│       │   ├── deployment.yaml
+│       │   └── service.yaml
+│       └── overlays/dev/
+│           ├── kustomization.yaml
+│           └── serviceaccount-patch.yaml
+└── README.md
+```
+
+## Reference
+
+- Full specification: `spec/module8_applications.txt`
+- Architecture: `architecture/diagrams/gitops-flow.md`
+
+================================================================================

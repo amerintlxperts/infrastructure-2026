@@ -1,0 +1,70 @@
+# =============================================================================
+# Reloader
+# =============================================================================
+# Watches ConfigMaps and Secrets for changes, then automatically triggers
+# rolling restarts of Deployments/StatefulSets that reference them.
+#
+# WHY USE RELOADER:
+# By default, Kubernetes doesn't restart pods when their ConfigMaps or Secrets
+# change. Reloader solves this by watching for changes and triggering rollouts.
+#
+# USAGE:
+# Add annotation to your Deployment/StatefulSet:
+#
+#   # Reload on ANY referenced ConfigMap/Secret change
+#   annotations:
+#     reloader.stakater.com/auto: "true"
+#
+#   # Or specify exactly which resources to watch:
+#   annotations:
+#     reloader.stakater.com/search: "true"
+#     configmap.reloader.stakater.com/reload: "my-configmap"
+#     secret.reloader.stakater.com/reload: "my-secret"
+#
+# This is especially useful with External Secrets - when AWS Secrets Manager
+# values change, the ExternalSecret syncs to Kubernetes, and Reloader
+# automatically restarts pods to pick up the new values.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: reloader
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"  # Install early
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/stakater/Reloader
+    path: deployments/kubernetes/chart/reloader
+    targetRevision: v1.0.72
+    helm:
+      valuesObject:
+        # Resource limits for t3.medium nodes
+        reloader:
+          deployment:
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 128Mi
+
+          # Watch all namespaces
+          watchGlobally: true
+
+          # Log level
+          logFormat: json
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: reloader
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

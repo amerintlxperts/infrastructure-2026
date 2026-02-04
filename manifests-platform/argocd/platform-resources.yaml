@@ -1,0 +1,35 @@
+# =============================================================================
+# Platform Resources
+# =============================================================================
+# Manages cluster-wide platform resources:
+# - ClusterSecretStore for AWS Secrets Manager
+# - ClusterIssuers for cert-manager
+# - ExternalSecrets for credentials
+#
+# This app syncs the manifests-platform/resources/ directory.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-resources
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"  # After operators are installed
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:amerintlxperts/infrastructure-2026.git
+    path: manifests-platform/resources
+    targetRevision: main
+    # Uses Kustomize (auto-detected from kustomization.yaml)
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
