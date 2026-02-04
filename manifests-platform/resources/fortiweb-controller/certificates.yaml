@@ -11,26 +11,6 @@
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: xperts-tls
-  namespace: fortiweb-controller
-spec:
-  secretName: xperts-tls
-  privateKey:
-    rotationPolicy: Always
-  commonName: xperts.amerintlxperts.com
-  dnsNames:
-    - xperts.amerintlxperts.com
-  usages:
-    - digital signature
-    - key encipherment
-    - server auth
-  issuerRef:
-    name: letsencrypt-prod
-    kind: ClusterIssuer
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
   name: canada-tls
   namespace: fortiweb-controller
 spec:
