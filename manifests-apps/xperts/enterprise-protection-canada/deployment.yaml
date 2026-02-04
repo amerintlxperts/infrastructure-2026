@@ -33,7 +33,7 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: nginx
-          image: ghcr.io/amerintlxperts/enterprise-protection-2026-canada:latest
+          image: ghcr.io/amerintlxperts/enterprise-protection-2026-canada:6e2c461
           ports:
             - containerPort: 8080
           resources:
