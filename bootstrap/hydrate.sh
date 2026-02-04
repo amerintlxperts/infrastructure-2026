@@ -56,7 +56,7 @@ GITHUB_REPO="${GITHUB_REPO:-infrastructure-2026}"
 # DNS Configuration (set here to skip prompts)
 DOMAIN_NAME="${DOMAIN_NAME:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
-DELEGATION_SET_ID="${DELEGATION_SET_ID:-N04333643VKH12NIINQ7I}"  # Reusable delegation set from 40docs (same AWS account)
+DELEGATION_SET_ID="${DELEGATION_SET_ID:-}"  # Set via environment variable or created during hydration
 
 # Derived names
 STATE_BUCKET="${PROJECT_NAME}-terraform-state-${AWS_REGION}"
