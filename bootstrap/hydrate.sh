@@ -567,7 +567,8 @@ EOF
         "iam:CreateOpenIDConnectProvider",
         "iam:DeleteOpenIDConnectProvider",
         "iam:GetOpenIDConnectProvider",
-        "iam:TagOpenIDConnectProvider"
+        "iam:TagOpenIDConnectProvider",
+        "iam:CreateServiceLinkedRole"
       ],
       "Resource": "*"
     },
