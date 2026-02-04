@@ -4,6 +4,10 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - external-secret.yaml
+  # Shared ConfigMaps for nginx with htpasswd auth
+  - secops-canada/configmap.yaml
+  - ai-canada/configmap.yaml
+  - enterprise-protection-canada/configmap.yaml
   # Canada region
   - landing-page-canada/deployment.yaml
   - landing-page-canada/service.yaml
