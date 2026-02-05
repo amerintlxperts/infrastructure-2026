@@ -47,3 +47,23 @@ spec:
   issuerRef:
     name: letsencrypt-prod
     kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: docs-tls
+  namespace: fortiweb-controller
+spec:
+  secretName: docs-tls
+  privateKey:
+    rotationPolicy: Always
+  commonName: docs.amerintlxperts.com
+  dnsNames:
+    - docs.amerintlxperts.com
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer

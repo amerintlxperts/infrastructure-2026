@@ -161,3 +161,20 @@ spec:
         method: head
         responseCode: 200
 
+    # =========================================================================
+    # Docs - xperts-2025 documentation site
+    # =========================================================================
+    - host: docs.amerintlxperts.com
+      path: /
+      default: false
+      backend:
+        serviceName: docs
+        serviceNamespace: docs
+        port: 80
+      tls:
+        enabled: true
+        secretName: docs-tls
+      healthCheck:
+        path: /healthz
+        method: head
+        responseCode: 200
