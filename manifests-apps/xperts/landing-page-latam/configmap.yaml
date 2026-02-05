@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: landing-page-latam-nginx-config
+  namespace: xperts
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+
+        location /healthz/ {
+            auth_basic off;
+            return 200 'OK';
+            add_header Content-Type text/plain;
+        }
+
+        location / {
+            auth_basic "Restricted Access";
+            auth_basic_user_file /etc/nginx/.htpasswd;
+            root /usr/share/nginx/html;
+            index index.html;
+            try_files $uri $uri/ /index.html;
+        }
+    }

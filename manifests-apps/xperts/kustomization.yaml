@@ -8,6 +8,8 @@ resources:
   - secops-canada/configmap.yaml
   - ai-canada/configmap.yaml
   - enterprise-protection-canada/configmap.yaml
+  - landing-page-canada/configmap.yaml
+  - landing-page-latam/configmap.yaml
   # Canada region
   - landing-page-canada/deployment.yaml
   - landing-page-canada/service.yaml

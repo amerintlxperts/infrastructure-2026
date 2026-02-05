@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: landing-page-canada
   namespace: xperts
+  annotations:
+    reloader.stakater.com/auto: "true"
 spec:
   replicas: 2
   selector:
@@ -43,13 +45,26 @@ spec:
               cpu: "100m"
           readinessProbe:
             httpGet:
-              path: /
+              path: /healthz/
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /
+              path: /healthz/
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 30
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/
+            - name: htpasswd-volume
+              mountPath: /etc/nginx/.htpasswd
+              subPath: htpasswd
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: landing-page-canada-nginx-config
+        - name: htpasswd-volume
+          secret:
+            secretName: xperts-htpasswd
